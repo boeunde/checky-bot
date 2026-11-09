@@ -45,10 +45,12 @@ function createEnv(nowIso) {
     getAllDayStartDate: () => new MockDate(ev.start),
     getAllDayEndDate: () => new MockDate(ev.end),
     getVisibility: () => ev.visibility || 'DEFAULT',
+    isRecurringEvent: () => !!ev.recurring,
   });
   const calendar = (id) => state.calendars[id] && {
     getId: () => id,
     getName: () => state.calendars[id].name,
+    getColor: () => state.calendars[id].color || '#4285F4',
     getEvents: (s, e) => state.calendars[id].events.filter((ev) => ev.start < e.getTime() && ev.end > s.getTime()).map(wrapEvent),
   };
 
@@ -98,7 +100,10 @@ function createEnv(nowIso) {
       MimeType: { JSON: 'json' },
     },
     Session: { getScriptTimeZone: () => state.tz, getEffectiveUser: () => ({ getEmail: () => 'team@example.com' }) },
-    Utilities: { getUuid: () => `conn${++state.uuid}-0000-0000` },
+    Utilities: {
+      getUuid: () => `conn${++state.uuid}-0000-0000`,
+      base64EncodeWebSafe: (s) => Buffer.from(s, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_'),
+    },
     CalendarApp: {
       Visibility: { DEFAULT: 'DEFAULT', PRIVATE: 'PRIVATE', CONFIDENTIAL: 'CONFIDENTIAL', PUBLIC: 'PUBLIC' },
       getCalendarById: (id) => calendar(id) || null,
@@ -113,7 +118,7 @@ function createEnv(nowIso) {
       if (url.startsWith('https://slack.com/api/')) {
         assert.strictEqual(opts.headers.Authorization, 'Bearer xoxb-test');
         const params = Object.assign({}, opts.payload);
-        ['view', 'blocks'].forEach((k) => { if (params[k]) params[k] = JSON.parse(params[k]); });
+        ['view', 'blocks', 'attachments'].forEach((k) => { if (params[k]) params[k] = JSON.parse(params[k]); });
         const res = slack(url.slice('https://slack.com/api/'.length), params);
         return { getContentText: () => JSON.stringify(res), getResponseCode: () => 200 };
       }
@@ -133,8 +138,10 @@ function createEnv(nowIso) {
     clearCalls: () => { state.calls.length = 0; state.responses.length = 0; },
     channel: (id) => JSON.parse(state.props[`CH_${id}`] || 'null'),
     meta: () => JSON.parse(state.props.META || 'null'),
-    posts: (channel) => env.calls('chat.postMessage').filter((c) => !channel || c.params.channel === channel).map((c) => c.params.text),
-    ephemerals: (user) => env.calls('chat.postEphemeral').filter((c) => !user || c.params.user === user).map((c) => c.params.text),
+    // A message as one string: its text, then each attachment's text on following lines.
+    posts: (channel) => env.calls('chat.postMessage').filter((c) => !channel || c.params.channel === channel).map(flatten),
+    ephemerals: (user) => env.calls('chat.postEphemeral').filter((c) => !user || c.params.user === user).map(flatten),
+    rawPosts: (channel) => env.calls('chat.postMessage').filter((c) => c.params.channel === channel).map((c) => c.params),
     addCalendar: (id, name, events = []) => { state.calendars[id] = { name, events }; },
     command: (p) => doPost({ parameter: Object.assign({ command: '/checky', token: 'vtok', trigger_id: 'TRIG', text: '', channel_name: 'general' }, p) }),
     interact: (payload) => doPost({ parameter: { payload: JSON.stringify(Object.assign({ token: 'vtok', trigger_id: 'TRIG' }, payload)) } }),
@@ -144,25 +151,38 @@ function createEnv(nowIso) {
   return env;
 }
 
+// A message as one string: its text, then each attachment's pretext and text, with links shown as their label.
+function flatten(call) {
+  const parts = [call.params.text || ''];
+  (call.params.attachments || []).forEach((a) => {
+    if (a.pretext) parts.push(a.pretext);
+    parts.push(a.text);
+  });
+  return parts.join('\n').replace(/<https?:[^|>]+\|([^>]+)>/g, '$1').trim();
+}
+
+const eidOf = (link) => Buffer.from(new URL(link).searchParams.get('eid').replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+
 const ev = (id, title, startIso, endIso, extra = {}) => Object.assign({ id, title, start: kst(startIso), end: kst(endIso) }, extra);
 const allDay = (id, title, startDate, endDateExclusive, extra = {}) => ev(id, title, `${startDate}T00:00`, `${endDateExclusive}T00:00`, Object.assign({ allDay: true }, extra));
 
-function settingsValues({ daily = {}, reminder = {} } = {}) {
+// The settings modal keeps on/off and weekdays (buttons) in private_metadata.draft and the rest in input state.
+// Values are only present for routines that are on, as hidden blocks send nothing.
+function settingsForm({ daily = {}, reminder = {} } = {}) {
   const d = Object.assign({ enabled: true, time: 540, scope: 'all', days: [1, 2, 3, 4, 5], empty: 'skip' }, daily);
   const r = Object.assign({ enabled: false, offset: 15, allDayTime: 540, days: [1, 2, 3, 4, 5] }, reminder);
-  const many = (arr) => arr.map((v) => ({ value: String(v) }));
   const one = (v) => ({ selected_option: { value: String(v) } });
-  return {
-    daily_enabled: { v: { selected_options: d.enabled ? [{ value: 'on' }] : [] } },
-    daily_time: { v: one(d.time) },
-    daily_scope: { v: one(d.scope) },
-    daily_days: { v: { selected_options: many(d.days) } },
-    daily_empty: { v: one(d.empty) },
-    reminder_enabled: { v: { selected_options: r.enabled ? [{ value: 'on' }] : [] } },
-    reminder_offset: { v: one(r.offset) },
-    reminder_allday_time: { v: one(r.allDayTime) },
-    reminder_days: { v: { selected_options: many(r.days) } },
+  const pad = (n) => String(n).padStart(2, '0');
+  const time = (m) => ({ v: { selected_time: `${pad(Math.floor(m / 60))}:${pad(m % 60)}` } });
+  const many = (arr) => ({ v: { selected_options: arr.map((v) => ({ value: String(v) })) } });
+  const values = {};
+  if (d.enabled) Object.assign(values, { daily_time: time(d.time), daily_scope: { v: one(d.scope) }, daily_days: many(d.days), daily_empty: { v: one(d.empty) } });
+  if (r.enabled) Object.assign(values, { reminder_offset: { v: one(r.offset) }, reminder_allday_time: time(r.allDayTime), reminder_days: many(r.days) });
+  const draft = {
+    daily: { enabled: d.enabled, time: 540, scope: 'all', days: d.days, empty: 'skip' },
+    reminder: { enabled: r.enabled, offset: 15, allDayTime: 540, days: r.days },
   };
+  return { values, draft };
 }
 
 /** Bot set up, invited to C1 by UA (first admin + installer), calendar cal1 connected. */
@@ -188,10 +208,11 @@ function addConnection(env, calendarId, user = 'UA') {
 
 function configure(env, settings, user = 'UA', index = 0) {
   const connId = env.channel('C1').connections[index].id;
+  const { values, draft } = settingsForm(settings);
   return env.interact({
     type: 'view_submission',
     user: { id: user },
-    view: { id: 'V3', callback_id: 'conn_settings', private_metadata: JSON.stringify({ channelId: 'C1', connId, parentViewId: 'V1' }), state: { values: settingsValues(settings) } },
+    view: { id: 'V3', callback_id: 'conn_settings', private_metadata: JSON.stringify({ channelId: 'C1', connId, parentViewId: 'V1', draft }), state: { values } },
   });
 }
 
@@ -296,11 +317,82 @@ const tests = {
     assert.ok(response(addConnection(env, 'cal1')).errors.calendar_id.includes('이미 연결'));
   },
 
+  'times use the Slack time picker and accept any minute': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    blockAction(env, 'edit_conn', env.channel('C1').connections[0].id);
+    const modal = env.calls('views.push').at(-1).params.view;
+    const picker = modal.blocks.find((b) => b.block_id === 'daily_time');
+    assert.deepStrictEqual([picker.type, picker.element.type, picker.element.initial_time], ['input', 'timepicker', '09:00']);
+
+    configure(env, { daily: { time: 0 }, reminder: { enabled: true, allDayTime: 12 * 60 + 47 } });
+    let conn = env.channel('C1').connections[0];
+    assert.strictEqual(conn.daily.time, 0, '자정');
+    assert.strictEqual(conn.reminder.allDayTime, 767, '오후 12:47');
+    configure(env, { daily: { time: 23 * 60 + 15 } });
+    conn = env.channel('C1').connections[0];
+    assert.strictEqual(conn.daily.time, 1395);
+    env.command({ user_id: 'UA', channel_id: 'C1' });
+    assert.ok(JSON.stringify(env.calls('views.open').at(-1).params.view).includes('오후 11:15'));
+  },
+
+  'on/off buttons redraw the settings screen, keeping picked values, without saving': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    const connId = env.channel('C1').connections[0].id;
+    blockAction(env, 'edit_conn', connId);
+    let modal = env.calls('views.push').at(-1).params.view;
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'daily_enabled').accessory.text.text, '● 켜짐');
+    const tabs = () => modal.blocks.find((b) => b.block_id === 'tabs').elements.map((e) => `${e.text.text}${e.style ? '+' : ''}`);
+    assert.deepStrictEqual(tabs(), ['하루 요약 · 켜짐+', '일정별 알림 · 꺼짐']);
+    assert.ok(!modal.blocks.some((b) => b.block_id === 'reminder_enabled'), 'only the selected tab is shown');
+    const days = modal.blocks.find((b) => b.block_id === 'daily_days');
+    assert.strictEqual(days.element.type, 'multi_static_select');
+    assert.deepStrictEqual(days.element.initial_options.map((o) => o.text.text), ['월', '화', '수', '목', '금']);
+    assert.strictEqual(days.optional, false);
+    assert.ok(!modal.blocks.some((b) => b.block_id === 'reminder_offset'), 'details of a routine that is off are hidden');
+
+    const picked = { daily_days: { v: { selected_options: [{ value: '2' }, { value: '6' }] } } };
+    const press = (actionId, value, values = {}) => {
+      env.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values } }, actions: [{ action_id: actionId, value }] });
+      modal = env.calls('views.update').at(-1).params.view;
+    };
+    const click = (routine, values) => press('toggle_routine', routine, values);
+    press('tab_reminder', 'reminder', picked);
+    assert.deepStrictEqual(tabs(), ['하루 요약 · 켜짐', '일정별 알림 · 꺼짐+']);
+    assert.ok(!modal.blocks.some((b) => b.block_id === 'daily_days'));
+    click('reminder');
+    assert.ok(modal.blocks.some((b) => b.block_id === 'reminder_offset'));
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'reminder_enabled').accessory.text.text, '● 켜짐');
+    press('tab_daily', 'daily');
+    assert.deepStrictEqual(modal.blocks.find((b) => b.block_id === 'daily_days').element.initial_options.map((o) => o.text.text), ['화', '토'], 'picks survive switching tabs');
+    assert.deepStrictEqual(env.channel('C1').connections[0].daily.days, [1, 2, 3, 4, 5], 'nothing saved before 저장');
+
+    click('daily');
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'daily_enabled').accessory.text.text, '○ 꺼짐');
+    assert.ok(!modal.blocks.some((b) => b.block_id === 'daily_days'));
+    click('daily');
+    assert.deepStrictEqual(modal.blocks.find((b) => b.block_id === 'daily_days').element.initial_options.map((o) => o.text.text), ['화', '토'], 'turning back on restores picks');
+    const before = env.calls('views.update').length;
+    env.interact({ type: 'block_actions', user: { id: 'UB' }, view: { id: 'V3', private_metadata: modal.private_metadata }, actions: [{ action_id: 'toggle_routine', value: 'daily' }] });
+    assert.strictEqual(env.calls('views.update').length, before, 'non-admin clicks are ignored');
+
+    const saved = env.interact({ type: 'view_submission', user: { id: 'UA' }, view: { id: 'V3', callback_id: 'conn_settings', private_metadata: modal.private_metadata, state: { values: {} } } });
+    assert.strictEqual(saved.content, '');
+    const conn = env.channel('C1').connections[0];
+    assert.deepStrictEqual(conn.daily.days, [2, 6]);
+    assert.strictEqual(conn.reminder.enabled, true);
+  },
+
   'routine settings require at least one routine and at least one day': () => {
     const env = connectedEnv('2026-11-09T10:00');
-    assert.ok(response(configure(env, { daily: { enabled: false } })).errors.daily_enabled);
-    assert.ok(response(configure(env, { daily: { days: [] } })).errors.daily_days);
-    assert.ok(response(configure(env, { reminder: { enabled: true, days: [] } })).errors.reminder_days);
+    const warns = (out) => {
+      const body = response(out);
+      assert.strictEqual(body.response_action, 'update');
+      return JSON.stringify(body.view.blocks);
+    };
+    assert.ok(warns(configure(env, { daily: { enabled: false } })).includes('하나 이상 켜야'));
+    assert.ok(warns(configure(env, { daily: { days: [] } })).includes('요일을 하나 이상'));
+    assert.ok(warns(configure(env, { reminder: { enabled: true, days: [] } })).includes('요일을 하나 이상'));
+    assert.deepStrictEqual(env.channel('C1').connections[0].daily.days, [1, 2, 3, 4, 5]);
     assert.strictEqual(configure(env, { daily: { time: 510, scope: 'timed' }, reminder: { enabled: true, offset: 5 } }).content, '');
     const conn = env.channel('C1').connections[0];
     assert.strictEqual(conn.daily.time, 510);
@@ -320,8 +412,9 @@ const tests = {
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1);
     const text = env.posts('C1')[0];
-    assert.ok(text.includes('*디자인팀*  디자인 리뷰') && text.includes('11월 9일 (월) 10:30 - 11:00'), text);
-    assert.ok(!/분 후/.test(text), text);
+    assert.strictEqual(text, ':bell: *오늘* | *디자인팀* | 11월 9일 월요일 | 총 1건\n10:30 - 11:00 디자인 리뷰');
+    const [attachment] = env.rawPosts('C1')[0].attachments;
+    assert.ok(attachment.pretext.startsWith(':bell:') && !attachment.text.includes('디자인팀'), 'calendar line sits outside the color bar');
 
     event.start = kst('2026-11-09T10:40');
     event.end = kst('2026-11-09T11:10');
@@ -329,6 +422,34 @@ const tests = {
     env.setNow('2026-11-09T10:25');
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 2);
+  },
+
+  'reminders from the same calendar at the same time share one message; a later addition is sent alone': () => {
+    const events = [
+      ev('b', '두번째', '2026-11-09T10:30', '2026-11-09T11:30'),
+      ev('a', '첫번째', '2026-11-09T10:30', '2026-11-09T11:00'),
+    ];
+    const env = connectedEnv('2026-11-09T10:00', events, { daily: { enabled: false }, reminder: { enabled: true, offset: 15 } });
+    env.addCalendar('cal2', '개발팀', [ev('c', '다른 캘린더', '2026-11-09T10:30', '2026-11-09T11:00')]);
+    addConnection(env, 'cal2');
+    configure(env, { daily: { enabled: false }, reminder: { enabled: true, offset: 15 } }, 'UA', 1);
+    env.clearCalls();
+    env.setNow('2026-11-09T10:15');
+    env.run('dispatchDue');
+    const posts = env.rawPosts('C1');
+    assert.strictEqual(posts.length, 2, 'one message per calendar');
+    const design = posts.find((p) => p.attachments[0].pretext.includes('디자인팀'));
+    assert.strictEqual(design.attachments.length, 2);
+    assert.ok(design.attachments[0].pretext.endsWith('| 총 2건') && !design.attachments[1].pretext, 'header once, with count');
+
+    events.push(ev('n', '새 일정', '2026-11-09T10:30', '2026-11-09T11:00'));
+    env.run('onCalendarChanged');
+    env.setNow('2026-11-09T10:16');
+    env.run('dispatchDue');
+    const latest = env.rawPosts('C1');
+    assert.strictEqual(latest.length, 3);
+    assert.strictEqual(latest[2].attachments.length, 1);
+    assert.ok(latest[2].attachments[0].text.includes('새 일정'));
   },
 
   'weekday filter uses the event day, not the send day': () => {
@@ -368,11 +489,13 @@ const tests = {
     const env = connectedEnv('2026-11-09T10:00', events, { daily: { enabled: false }, reminder: { enabled: true, offset: 15 } });
     env.setNow('2026-11-09T10:15');
     env.run('dispatchDue');
-    const posts = env.posts('C1');
-    assert.strictEqual(posts.length, 2);
-    const meeting = posts.find((p) => p.includes('공개 회의'));
+    const [post] = env.rawPosts('C1');
+    assert.strictEqual(env.rawPosts('C1').length, 1);
+    const texts = post.attachments.map((a) => a.text);
+    assert.strictEqual(texts.length, 2);
+    const meeting = texts.find((t) => t.includes('공개 회의'));
     assert.ok(meeting.includes('> 회의실 &amp; 링크') && !meeting.includes('<p>'), meeting);
-    assert.ok(posts.find((p) => p.includes('긴 설명')).includes(`${'a'.repeat(300)}…`));
+    assert.ok(texts.find((t) => t.includes('긴 설명')).includes(`${'a'.repeat(300)}…`));
   },
 
   'daily summary respects scope and the empty-day option': () => {
@@ -381,7 +504,8 @@ const tests = {
     timed.setNow('2026-11-09T09:00');
     timed.run('dispatchDue');
     const summary = timed.posts('C1')[0];
-    assert.ok(summary.includes('11월 9일 (월) 일정') && summary.includes('*디자인팀*  일정 1개') && summary.includes('14:00 - 15:00  주간 회의') && !summary.includes('창립기념일'), summary);
+    assert.strictEqual(summary, '*오늘* | *디자인팀* | 11월 9일 월요일 | 총 1건\n14:00 - 15:00 주간 회의');
+    assert.strictEqual(timed.rawPosts('C1')[0].attachments[0].color, '#4285F4');
 
     const skip = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'skip' } });
     skip.setNow('2026-11-10T09:00');
@@ -391,12 +515,13 @@ const tests = {
     const send = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'send' } });
     send.setNow('2026-11-10T09:00');
     send.run('dispatchDue');
-    assert.ok(send.posts('C1')[0].includes('*디자인팀*  일정 없음'));
+    assert.strictEqual(send.posts('C1')[0], '*오늘* | *디자인팀* | 11월 10일 화요일 | 총 0건\n일정 없음');
   },
 
   'daily summaries for the same channel and time are grouped by calendar in one message': () => {
     const env = connectedEnv('2026-11-09T08:40', [ev('a1', 'A 회의', '2026-11-09T10:00', '2026-11-09T11:00'), ev('a2', 'A 리뷰', '2026-11-09T15:00', '2026-11-09T16:00')]);
     env.addCalendar('cal2', '개발팀', [ev('b1', 'B 배포', '2026-11-09T13:00', '2026-11-09T14:00')]);
+    env.state.calendars.cal2.color = '#E67C73';
     env.addCalendar('cal3', '전사', [ev('c1', '전사 공지', '2026-11-09T17:00', '2026-11-09T18:00')]);
     addConnection(env, 'cal2');
     addConnection(env, 'cal3');
@@ -407,14 +532,43 @@ const tests = {
     env.run('dispatchDue');
     const nine = env.posts('C1');
     assert.strictEqual(nine.length, 1);
-    const text = nine[0];
-    assert.ok(text.indexOf('*디자인팀*  일정 2개') < text.indexOf('*개발팀*  일정 1개'), text);
-    assert.ok(text.includes('A 회의') && text.includes('A 리뷰') && text.includes('B 배포') && !text.includes('전사 공지'), text);
+    // One attachment per event; the calendar header rides only on each calendar's first event, outside the bar.
+    const attachments = env.rawPosts('C1')[0].attachments;
+    assert.deepStrictEqual(attachments.map((a) => a.pretext || null), [
+      '*오늘* | *디자인팀* | 11월 9일 월요일 | 총 2건', null, '*오늘* | *개발팀* | 11월 9일 월요일 | 총 1건',
+    ]);
+    assert.deepStrictEqual(attachments.map((a) => a.color), ['#4285F4', '#4285F4', '#E67C73']);
+    assert.strictEqual(nine[0], [
+      '*오늘* | *디자인팀* | 11월 9일 월요일 | 총 2건', '10:00 - 11:00 A 회의', '15:00 - 16:00 A 리뷰',
+      '*오늘* | *개발팀* | 11월 9일 월요일 | 총 1건', '13:00 - 14:00 B 배포',
+    ].join('\n'));
     env.setNow('2026-11-09T10:00');
     env.run('rebuildSchedule');
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 2);
-    assert.ok(env.posts('C1')[1].includes('*전사*  일정 1개'));
+    assert.ok(env.posts('C1')[1].startsWith('*오늘* | *전사*'));
+  },
+
+  'event titles link to the event, using the occurrence id for recurring events': () => {
+    const events = [
+      ev('abc123@google.com', '단건 <회의>', '2026-11-09T14:00', '2026-11-09T15:00'),
+      ev('weekly9@google.com', '주간 회의', '2026-11-09T16:00', '2026-11-09T17:00', { recurring: true }),
+      allDay('hol@google.com', '휴일', '2026-11-09', '2026-11-10', { recurring: true }),
+    ];
+    const env = connectedEnv('2026-11-09T08:50', events);
+    env.setNow('2026-11-09T09:00');
+    env.run('dispatchDue');
+    const texts = env.rawPosts('C1')[0].attachments.map((a) => a.text);
+    const link = (text) => text.match(/<(https:[^|]+)\|([^>]+)>/);
+    const [, holLink, holTitle] = link(texts[0]);
+    const [, oneLink, oneTitle] = link(texts[1]);
+    const [, weeklyLink] = link(texts[2]);
+    assert.strictEqual(holTitle, '휴일');
+    assert.strictEqual(oneTitle, '단건 &lt;회의&gt;');
+    assert.ok(oneLink.startsWith('https://www.google.com/calendar/event?eid='));
+    assert.strictEqual(eidOf(oneLink), 'abc123 cal1');
+    assert.strictEqual(eidOf(weeklyLink), 'weekly9_20261109T070000Z cal1');
+    assert.strictEqual(eidOf(holLink), 'hol_20261109 cal1');
   },
 
   'a reminder that would arrive more than 5 minutes after the start is dropped': () => {
@@ -472,13 +626,23 @@ const tests = {
     assert.strictEqual(kicked.channel('C1').connections[0].pausedReason, 'removed');
   },
 
-  'only channel admins can delete bot messages, and only bot messages': () => {
+  'deleting a bot message asks for confirmation; only channel admins, only bot messages': () => {
     const env = connectedEnv('2026-11-09T10:00');
     const shortcut = (user, message) => env.interact({ type: 'message_action', callback_id: 'delete_message', user: { id: user }, channel: { id: 'C1' }, message, response_url: 'https://hooks.slack.com/actions/x', api_app_id: 'A1' });
     shortcut('UB', { user: 'UBOT', ts: '1.0' });
     shortcut('UA', { user: 'UX', ts: '2.0' });
+    assert.strictEqual(env.calls('views.open').length, 0);
+
+    shortcut('UA', { user: 'UBOT', ts: '3.0', attachments: [{ pretext: '*오늘* | *디자인팀*', text: '14:00 - 15:00 주간 회의' }] });
+    assert.strictEqual(env.calls('chat.delete').length, 0, 'nothing is deleted before confirming');
+    const modal = env.calls('views.open')[0].params.view;
+    assert.strictEqual(modal.callback_id, 'delete_message');
+    assert.ok(JSON.stringify(modal.blocks).includes('주간 회의'));
+
+    const confirm = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'VD', callback_id: 'delete_message', private_metadata: modal.private_metadata, state: { values: {} } } });
+    confirm('UB');
     assert.strictEqual(env.calls('chat.delete').length, 0);
-    shortcut('UA', { user: 'UBOT', ts: '3.0' });
+    assert.strictEqual(confirm('UA').content, '');
     assert.deepStrictEqual(env.calls('chat.delete').map((c) => c.params.ts), ['3.0']);
     const replies = env.state.responses.map((r) => r.body.text);
     assert.ok(replies[0].includes('관리자만') && replies[1].includes('보낸 메시지만') && replies[2].includes('삭제했습니다'), replies.join('|'));
@@ -495,8 +659,8 @@ const tests = {
     const msgs = env.ephemerals('UA');
     assert.ok(msgs.every((m) => m.startsWith('[테스트')));
     assert.ok(msgs[0].startsWith('[테스트] ') && msgs[0].includes('11월 6일 (금)'));
-    assert.ok(msgs.some((m) => m.startsWith('[테스트 · 하루 요약]') && m.includes('*디자인팀*  일정 1개') && m.includes('금요일 회의')));
-    assert.ok(msgs.some((m) => m.startsWith('[테스트 · 일정별 알림]') && m.includes('*디자인팀*  금요일 회의') && m.includes('14:00 - 15:00')));
+    assert.ok(msgs.includes('[테스트 · 하루 요약]\n*디자인팀* | 11월 6일 금요일 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
+    assert.ok(msgs.includes('[테스트 · 일정별 알림]\n:bell: *디자인팀* | 11월 6일 금요일 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
     assert.ok(!msgs.join('\n').includes('목요일 회의') && !msgs.join('\n').includes('다음 회의'));
     assert.strictEqual(env.posts('C1').length, 0);
   },
