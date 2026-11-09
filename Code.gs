@@ -1385,7 +1385,8 @@ function changeAttachment_(conn, color, kind, info) {
   const linked = info.link && kind !== 'deleted' ? `<${info.link}|${title}>` : title;
   const line = `${date ? `${date} ` : ''}${when} ${linked}${info.recurring ? ' (반복)' : ''}`;
   return withColor_({
-    text: kind === 'deleted' ? line : withDescription_([line], info),
+    // 삭제된 일정은 날짜·시간·제목 줄 전체에 취소선을 긋습니다.
+    text: kind === 'deleted' ? `~${line}~` : withDescription_([line], info),
     fallback: `${conn.calendarName} · 일정 ${CHANGE_KINDS[kind]} · ${info.title}`,
     mrkdwn_in: ['pretext', 'text'],
   }, color);

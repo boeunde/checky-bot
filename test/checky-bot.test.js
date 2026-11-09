@@ -816,7 +816,7 @@ const tests = {
 
     env.calendarEdit('cal1', 'old', { deleted: true });
     dispatchAt('2026-11-09T10:16');
-    assert.strictEqual(env.posts('C1')[2], '🗑️ *일정 삭제* | 디자인팀 | 총 1건\n11월 10일 (화) 11:00 - 12:00 기존 회의');
+    assert.strictEqual(env.posts('C1')[2], '🗑️ *일정 삭제* | 디자인팀 | 총 1건\n~11월 10일 (화) 11:00 - 12:00 기존 회의~');
     assert.ok(!env.rawPosts('C1')[2].attachments[0].text.includes('<https'), 'deleted events have no link');
   },
 
@@ -851,7 +851,7 @@ const tests = {
     env.calendarEdit('cal1', 'rec', { title: '스탠드업 회의' });
     env.run('dispatchDue');
     const posts = env.posts('C1');
-    assert.ok(posts.includes('🗑️ *일정 삭제* | 디자인팀 | 총 1건\n11월 11일 (수) 10:00 - 11:00 공개 회의'), posts.join('\n---\n'));
+    assert.ok(posts.includes('🗑️ *일정 삭제* | 디자인팀 | 총 1건\n~11월 11일 (수) 10:00 - 11:00 공개 회의~'), posts.join('\n---\n'));
     assert.ok(posts.includes('✏️ *일정 변경* | 디자인팀 | 총 1건\n11월 10일 (화) 10:00 - 10:30 스탠드업 회의 (반복)'), posts.join('\n---\n'));
   },
 
