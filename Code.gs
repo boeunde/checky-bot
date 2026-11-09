@@ -1,5 +1,5 @@
 /**
- * 공용 Google 캘린더 일정을 Slack 채널로 알려주는 스크립트.
+ * checky-bot: 공용 Google 캘린더 일정을 Slack 채널로 알려주는 스크립트.
  *
  * 스크립트 속성(프로젝트 설정 > 스크립트 속성)에 아래 두 값을 넣어야 합니다.
  *   CALENDAR_ID        공용 캘린더 ID
@@ -34,7 +34,7 @@ function setup() {
   }
 
   const calendar = getCalendar_();
-  postToSlack_(`:white_check_mark: 캘린더 알림이 연결되었습니다: *${escapeSlack_(calendar.getName())}*`);
+  postToSlack_(`:white_check_mark: checky-bot이 연결되었습니다: *${escapeSlack_(calendar.getName())}*`);
 
   ScriptApp.getProjectTriggers()
     .filter((trigger) => TRIGGER_HANDLERS.includes(trigger.getHandlerFunction()))
