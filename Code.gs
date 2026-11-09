@@ -71,6 +71,9 @@ function setup() {
   ScriptApp.newTrigger('rebuildSchedule').timeBased().everyMinutes(10).create();
   syncCalendarTriggers_();
   invalidateSchedule_();
+  if (typeof Calendar === 'undefined') {
+    console.warn('변경 알림(2단계)을 쓰려면 편집기 왼쪽 서비스 + 에서 Google Calendar API를 추가하세요.');
+  }
   console.log(`Slack 봇 ${auth.user}(으)로 연결되었습니다. 이제 웹 앱으로 배포하세요.`);
 }
 
@@ -78,12 +81,18 @@ function setup() {
 function rebuildSchedule() {
   syncCalendarTriggers_();
   const { failures } = rebuildSchedule_();
+  // 변경 알림: 트리거가 없는 캘린더(15개 초과)와 놓친 변경을 여기서 확인합니다.
+  failures.push(...syncChanges_());
   if (failures.length) throw new Error(`일부 캘린더를 읽지 못했습니다.\n${failures.join('\n')}`);
 }
 
-/** 캘린더가 바뀌면: 다음 1분 실행 때 목록을 다시 만들게 합니다. */
-function onCalendarChanged() {
+/** 캘린더가 바뀌면: 다음 1분 실행 때 목록을 다시 만들고, 변경 알림을 켠 캘린더면 바뀐 일정을 확인합니다. */
+function onCalendarChanged(e) {
   invalidateSchedule_();
+  if (e && e.calendarId) {
+    const failures = syncChanges_(e.calendarId);
+    if (failures.length) console.error(failures.join('\n'));
+  }
 }
 
 /** 1분마다: 목록에서 지금 보낼 알림만 보냅니다. 캘린더를 읽지 않아 가볍습니다. */
@@ -120,6 +129,11 @@ function dispatchDue() {
           handleSendFailure_(item.channel, err);
         }
       });
+    try {
+      failures.push(...dispatchChanges_(now));
+    } catch (err) {
+      failures.push(`변경 알림: ${err.message}`);
+    }
     if (failures.length) console.error(failures.join('\n'));
   } finally {
     cache.remove('dispatching');
@@ -679,7 +693,7 @@ function handleBlockAction_(payload, userId) {
   if (!chId) return;
   const ch = loadChannel_(chId);
   if (!isAdmin_(ch, userId)) return; // 관리자가 아니면 무시합니다.
-  if (action.action_id === 'toggle_routine' || action.action_id === 'tab_daily' || action.action_id === 'tab_reminder') {
+  if (action.action_id === 'toggle_routine' || action.action_id === 'tab_daily' || action.action_id === 'tab_reminder' || action.action_id === 'tab_changes') {
     editDraft_(payload, ch, chId, action);
     return;
   }
@@ -813,6 +827,8 @@ function submitChangeCalendar_(meta, ch, values, userId) {
     target.calendarName = calendar.getName();
     target.error = null;
     target.updatedAt = Date.now();
+    // 변경 알림은 새 캘린더의 지금 일정을 기준으로 다시 시작합니다.
+    if (target.changes) target.changes.since = Date.now();
     addLog_(c, userId, `캘린더 변경: ${escapeSlack_(before)} → ${escapeSlack_(target.calendarName)}`);
     changed = target;
   });
@@ -828,8 +844,9 @@ function submitChangeCalendar_(meta, ch, values, userId) {
  * 나머지는 입력 값에 있습니다. 숨겨진(꺼진) 루틴의 값은 draft에 남아 있습니다.
  */
 function draftFromView_(meta, values, conn) {
-  const base = meta.draft || { daily: conn.daily, reminder: conn.reminder };
+  const base = meta.draft || { daily: conn.daily, reminder: conn.reminder, changes: changesOf_(conn) };
   const draft = JSON.parse(JSON.stringify(base));
+  draft.changes = Object.assign(defaultChanges_(), draft.changes || {});
   const pick = (block) => {
     const b = values && values[block];
     return b && b.v && b.v.selected_option ? b.v.selected_option.value : null;
@@ -844,14 +861,21 @@ function draftFromView_(meta, values, conn) {
     const b = values && values[`${name}_days`];
     if (b && b.v) draft[name].days = WEEK_ORDER.filter((d) => (b.v.selected_options || []).some((o) => Number(o.value) === d));
   });
+  const types = values && values.changes_types;
+  if (types && types.v) draft.changes.types = Object.keys(CHANGE_KINDS).filter((k) => (types.v.selected_options || []).some((o) => o.value === k));
+  const wait = pick('changes_wait');
+  if (wait !== null) draft.changes.wait = Number(wait);
+  const past = pick('changes_past');
+  if (past !== null) draft.changes.past = past === 'on';
   return draft;
 }
 
 function draftProblems_(draft) {
   const problems = {};
-  if (!draft.daily.enabled && !draft.reminder.enabled) problems.none = true;
+  if (!draft.daily.enabled && !draft.reminder.enabled && !draft.changes.enabled) problems.none = true;
   if (draft.daily.enabled && !draft.daily.days.length) problems.daily = true;
   if (draft.reminder.enabled && !draft.reminder.days.length) problems.reminder = true;
+  if (draft.changes.enabled && !draft.changes.types.length) problems.changes = true;
   return problems;
 }
 
@@ -878,12 +902,16 @@ function submitConnSettings_(meta, ch, values, userId) {
   }
   const daily = draft.daily;
   const reminder = draft.reminder;
+  const changes = draft.changes;
 
   const saved = updateChannel_(meta.channelId, (c) => {
     const target = c.connections.find((x) => x.id === meta.connId);
     if (!target) return false;
     target.daily = daily;
     target.reminder = reminder;
+    // 변경 알림을 새로 켜면 그 시점의 일정을 기준으로 삼아, 그 뒤의 변경부터 알립니다.
+    const wasOn = changesOf_(target).enabled;
+    target.changes = { enabled: changes.enabled, types: changes.types, wait: changes.wait, past: changes.past, since: changes.enabled && !wasOn ? Date.now() : changesOf_(target).since };
     target.updatedAt = Date.now();
     addLog_(c, userId, `알림 설정 변경: ${escapeSlack_(target.calendarName)}`);
     return true;
@@ -973,6 +1001,7 @@ function newConnection_(calendarId, calendarName, userId) {
     updatedAt: Date.now(),
     daily: { enabled: true, time: 9 * 60, scope: 'all', days: WEEKDAYS.slice(), empty: 'skip' },
     reminder: { enabled: false, offset: 15, allDayTime: 9 * 60, days: WEEKDAYS.slice() },
+    changes: defaultChanges_(),
   };
 }
 
@@ -1042,6 +1071,389 @@ function runTest_(chId, conn, userId) {
   say(`*${name}*, *${formatDay_(day)}* 에 등록된 일정입니다.`);
   messages.slice(0, TEST_MESSAGE_LIMIT).forEach((m) => say(m.text, m.attachments));
   if (messages.length > TEST_MESSAGE_LIMIT) say(`외 ${messages.length - TEST_MESSAGE_LIMIT}건은 생략했습니다.`);
+}
+
+// ─── 변경 알림 (2단계) ────────────────────────────────────
+//
+// 1. 캘린더가 바뀌면(onCalendarChanged) 또는 10분마다, 변경 알림을 켠 캘린더를 Google Calendar API로
+//    "지난번 이후 바뀐 일정"만 받아 옵니다(syncToken). 고급 서비스 "Google Calendar API"가 필요합니다.
+// 2. 일정마다 저장해 둔 요약(제목·시간·설명)과 비교해 등록/변경/삭제를 판단하고 대기 목록에 넣습니다.
+//    참석자 응답처럼 이 셋이 아닌 변경은 무시합니다.
+// 3. 1분마다(dispatchDue) 마지막 변경 뒤 대기 시간이 지난 것만 보냅니다. 대기 중에 또 바뀌면 다시 기다립니다.
+
+const CHANGE_WAITS = [0, 1, 3]; // 분
+const CHANGE_KINDS = { created: '등록', updated: '변경', deleted: '삭제' };
+const CHANGE_EMOJI = { created: '🆕', updated: '✏️', deleted: '🗑️' };
+const SNAPSHOT_KEEP = 30 * DAY; // 이보다 오래 지난 일정의 요약은 지웁니다(저장 공간 절약).
+const CHUNK_SIZE = 2500; // 스크립트 속성 한 칸(9KB)에 한글이 들어가도 넘지 않는 글자 수
+
+function defaultChanges_() {
+  return { enabled: false, types: [], wait: 1, past: false, since: 0 };
+}
+
+/** 2단계 이전에 만든 연결에는 changes가 없어 기본값으로 채웁니다. */
+function changesOf_(conn) {
+  return Object.assign(defaultChanges_(), conn.changes || {});
+}
+
+/** 캘린더 ID → 변경 알림을 켠 연결 목록 */
+function watchedCalendars_() {
+  const watched = {};
+  loadMeta_().channels.forEach((chId) => {
+    const ch = loadChannel_(chId);
+    if (!ch) return;
+    ch.connections.forEach((conn) => {
+      if (conn.paused || !changesOf_(conn).enabled) return;
+      (watched[conn.calendarId] = watched[conn.calendarId] || []).push({ chId, conn });
+    });
+  });
+  return watched;
+}
+
+/** calendarId를 주면 그 캘린더만, 없으면 변경 알림을 켠 모든 캘린더를 확인합니다. */
+function syncChanges_(calendarId) {
+  const watched = watchedCalendars_();
+  const ids = calendarId ? [calendarId].filter((id) => watched[id]) : Object.keys(watched);
+  if (!calendarId) cleanupCalendarStates_(watched);
+  if (!ids.length) return [];
+  if (typeof Calendar === 'undefined') {
+    notifyInstallerOnce_('calendar-api', ':warning: 변경 알림을 쓰려면 Apps Script 편집기 왼쪽 *서비스 +* 에서 *Google Calendar API*를 추가해야 합니다. 추가하기 전까지 변경 알림은 보내지 않습니다.');
+    return [];
+  }
+  const failures = [];
+  ids.forEach((id) => {
+    try {
+      syncCalendar_(id, watched[id]);
+    } catch (err) {
+      failures.push(`변경 알림 ${id}: ${err.message}`);
+    }
+  });
+  return failures;
+}
+
+function syncCalendar_(calendarId, watchers) {
+  const key = calendarStateKey_(calendarId);
+  const now = Date.now();
+  const state = loadChunked_(key);
+  let changes;
+  let next;
+  if (!state) {
+    // 처음: 지금 일정을 기준으로 저장합니다. 켠 뒤 첫 확인 전에 바뀐 일정은 알립니다.
+    ({ state: next, changes } = fullSync_(calendarId, now, Math.min(...watchers.map((w) => changesOf_(w.conn).since || now))));
+  } else {
+    let listed;
+    try {
+      listed = listEvents_(calendarId, { syncToken: state.token }); // 이어 받기에는 삭제된 일정도 함께 옵니다.
+    } catch (err) {
+      if (!/410|sync ?token/i.test(err.message)) throw err;
+      // 구글이 확인 기록을 지웠으면 처음부터 다시 받습니다. 마지막 확인 이후 바뀐 일정만 알립니다.
+      ({ state: next, changes } = fullSync_(calendarId, now, state.syncedAt));
+      listed = null;
+    }
+    if (listed) {
+      next = state;
+      changes = listed.items.map((ev) => diffEvent_(calendarId, ev, next, now)).filter(Boolean);
+      next.token = listed.token;
+    }
+  }
+  next.syncedAt = now;
+  pruneSnapshots_(next, now);
+  saveChunked_(key, next);
+  if (changes.length) queueChanges_(watchers, changes, now);
+}
+
+function fullSync_(calendarId, now, since) {
+  const listed = listEvents_(calendarId, {});
+  const state = { token: listed.token, baselineAt: now, syncedAt: now, ev: {} };
+  const changes = [];
+  listed.items.forEach((ev) => {
+    const snap = snapshot_(ev);
+    if (!snap) return;
+    state.ev[ev.id] = snap;
+    const updated = Date.parse(ev.updated || '') || 0;
+    if (since && updated >= since) {
+      const created = Date.parse(ev.created || '') || 0;
+      changes.push(changeOf_(calendarId, ev, snap, created >= since ? 'created' : 'updated', now));
+    }
+  });
+  return { state, changes };
+}
+
+function listEvents_(calendarId, params) {
+  const items = [];
+  let pageToken;
+  let token = null;
+  do {
+    const res = Calendar.Events.list(calendarId, Object.assign({ maxResults: 250, singleEvents: false, pageToken }, params));
+    (res.items || []).forEach((item) => items.push(item));
+    pageToken = res.nextPageToken;
+    token = res.nextSyncToken || token;
+  } while (pageToken);
+  return { items, token };
+}
+
+/** 비교용 요약. 비공개이거나 제목이 없어(세부정보를 볼 수 없어) 알리지 않을 일정은 null입니다. */
+function snapshot_(ev) {
+  if (ev.status === 'cancelled') return null;
+  if (ev.visibility === 'private' || ev.visibility === 'confidential') return null;
+  const title = (ev.summary || '').trim();
+  if (!title) return null;
+  const time = apiTimes_(ev.start, ev.end);
+  return {
+    t: title.slice(0, 80),
+    s: time.start,
+    e: time.end,
+    a: time.allDay ? 1 : 0,
+    r: ev.recurrence ? 1 : 0,
+    h: hash_([title, JSON.stringify(ev.start), JSON.stringify(ev.end), ev.description || ''].join('\u0001')),
+  };
+}
+
+function apiTimes_(start, end) {
+  if (start && start.date) {
+    const s = Date.parse(`${start.date}T00:00:00+09:00`);
+    const e = end && end.date ? Date.parse(`${end.date}T00:00:00+09:00`) : s + DAY;
+    return { allDay: true, start: s, end: e };
+  }
+  return { allDay: false, start: Date.parse(start.dateTime), end: Date.parse(end.dateTime) };
+}
+
+/** 바뀐 일정 하나를 등록/변경/삭제로 판단합니다. 알릴 것이 없으면 null. */
+function diffEvent_(calendarId, ev, state, now) {
+  const prev = state.ev[ev.id];
+  if (ev.status === 'cancelled') {
+    if (prev) {
+      delete state.ev[ev.id];
+      return { id: ev.id, kind: 'deleted', info: infoFromSnap_(prev), past: !prev.r && prev.e < now };
+    }
+    // 반복 일정의 한 회차만 삭제: 원래 일정의 제목과 그 회차 시각으로 알립니다.
+    const master = ev.recurringEventId && state.ev[ev.recurringEventId];
+    if (!master || !ev.originalStartTime) return null;
+    const start = apiTimes_(ev.originalStartTime, ev.originalStartTime).start;
+    const info = { title: master.t, start, end: start + (master.e - master.s), allDay: !!master.a, recurring: false };
+    return { id: ev.id, kind: 'deleted', info, past: info.end < now };
+  }
+  const snap = snapshot_(ev);
+  if (!snap) {
+    // 공개 일정을 비공개로 바꾸면 삭제로 봅니다.
+    if (!prev) return null;
+    delete state.ev[ev.id];
+    return { id: ev.id, kind: 'deleted', info: infoFromSnap_(prev), past: !prev.r && prev.e < now };
+  }
+  state.ev[ev.id] = snap;
+  if (prev && prev.h === snap.h) return null; // 제목·시간·설명이 그대로면(예: 참석자 응답) 알리지 않습니다.
+  const created = Date.parse(ev.created || '') || 0;
+  const existedBefore = prev || ev.recurringEventId || (created && created < state.baselineAt);
+  return changeOf_(calendarId, ev, snap, existedBefore ? 'updated' : 'created', now);
+}
+
+function changeOf_(calendarId, ev, snap, kind, now) {
+  const info = {
+    title: snap.t,
+    start: snap.s,
+    end: snap.e,
+    allDay: !!snap.a,
+    recurring: !!snap.r,
+    link: ev.htmlLink || null,
+    description: cleanDescription_(ev.description),
+  };
+  if (snap.r) {
+    // 반복 일정은 다음 회차를 보여 줍니다. 다음 회차가 없으면 끝난 반복 일정입니다.
+    const next = nextOccurrence_(calendarId, ev.id, now);
+    if (next) Object.assign(info, next);
+  }
+  return { id: ev.id, kind, info, past: snap.r ? !info.upcoming : info.end < now };
+}
+
+function nextOccurrence_(calendarId, eventId, now) {
+  try {
+    const res = Calendar.Events.instances(calendarId, eventId, { timeMin: new Date(now).toISOString(), maxResults: 1 });
+    const item = res.items && res.items[0];
+    if (!item) return null;
+    const time = apiTimes_(item.start, item.end);
+    return { start: time.start, end: time.end, upcoming: true };
+  } catch (err) {
+    return null;
+  }
+}
+
+function infoFromSnap_(snap) {
+  return { title: snap.t, start: snap.s, end: snap.e, allDay: !!snap.a, recurring: !!snap.r, link: null, description: '' };
+}
+
+function pruneSnapshots_(state, now) {
+  Object.keys(state.ev).forEach((id) => {
+    const snap = state.ev[id];
+    if (!snap.r && snap.e < now - SNAPSHOT_KEEP) delete state.ev[id];
+  });
+}
+
+/** 같은 일정의 변경을 합칩니다. 등록 뒤 변경은 등록, 등록 뒤 삭제는 알림 없음(null)입니다. */
+function mergeKind_(before, after) {
+  if (!before) return after;
+  if (before === 'created') return after === 'deleted' ? null : 'created';
+  if (before === 'deleted') return after === 'deleted' ? 'deleted' : 'updated';
+  return after === 'deleted' ? 'deleted' : 'updated';
+}
+
+function queueChanges_(watchers, changes, now) {
+  withLock_(() => {
+    const pending = loadChunked_('PENDING') || {};
+    watchers.forEach(({ chId, conn }) => {
+      changes.forEach((change) => {
+        const key = `${conn.id}|${change.id}`;
+        const kind = mergeKind_(pending[key] && pending[key].kind, change.kind);
+        if (!kind) {
+          delete pending[key];
+          return;
+        }
+        pending[key] = { chId, connId: conn.id, kind, info: change.info, past: change.past, at: now };
+      });
+    });
+    saveChunked_('PENDING', pending);
+  });
+}
+
+/** 1분마다: 대기 시간이 지난 변경 알림을 보냅니다. */
+function dispatchChanges_(now) {
+  const failures = [];
+  const ready = [];
+  withLock_(() => {
+    const pending = loadChunked_('PENDING');
+    if (!pending || !Object.keys(pending).length) return;
+    const channels = {};
+    Object.keys(pending).forEach((key) => {
+      const p = pending[key];
+      if (!(p.chId in channels)) channels[p.chId] = loadChannel_(p.chId);
+      const conn = channels[p.chId] && channels[p.chId].connections.find((c) => c.id === p.connId);
+      const settings = conn && changesOf_(conn);
+      if (!conn || conn.paused || !settings.enabled) {
+        delete pending[key];
+        return;
+      }
+      if (now < p.at + settings.wait * MINUTE) return; // 아직 기다리는 중
+      delete pending[key];
+      if (!settings.types.includes(p.kind)) return;
+      if (p.past && !settings.past) return;
+      ready.push(Object.assign({ conn }, p));
+    });
+    saveChunked_('PENDING', pending);
+  });
+
+  const groups = {};
+  ready.forEach((p) => {
+    const key = `${p.chId}|${p.connId}|${p.kind}`;
+    (groups[key] = groups[key] || []).push(p);
+  });
+  const colors = {};
+  Object.keys(groups).forEach((key) => {
+    const items = groups[key].sort((a, b) => a.info.start - b.info.start);
+    const { chId, conn, kind } = items[0];
+    if (!(conn.calendarId in colors)) colors[conn.calendarId] = calendarColor_(openCalendar_(conn.calendarId));
+    try {
+      changeMessages_(conn, colors[conn.calendarId], kind, items.map((p) => p.info))
+        .forEach((attachments) => postMessage_(chId, '', attachments));
+    } catch (err) {
+      failures.push(`${chId}: ${err.message}`);
+      handleSendFailure_(chId, err);
+    }
+  });
+  return failures;
+}
+
+/** "🆕 일정 등록 | 캘린더 | 총 n건" 머리글 + 일정마다 색 막대. 50건이 넘으면 나눠 보냅니다. */
+function changeMessages_(conn, color, kind, infos) {
+  const messages = [];
+  for (let i = 0; i < infos.length; i += MESSAGE_ATTACHMENT_LIMIT) {
+    messages.push(infos.slice(i, i + MESSAGE_ATTACHMENT_LIMIT).map((info, index) => {
+      const attachment = changeAttachment_(conn, color, kind, info);
+      if (index === 0) attachment.pretext = `${CHANGE_EMOJI[kind]} *일정 ${CHANGE_KINDS[kind]}* | ${escapeSlack_(conn.calendarName)} | 총 ${infos.length}건`;
+      return attachment;
+    }));
+  }
+  return messages;
+}
+
+function changeAttachment_(conn, color, kind, info) {
+  const lastDay = info.allDay ? info.end - DAY : info.start;
+  let date = formatDay_(info.start);
+  if (info.allDay && kstDayStart_(lastDay) > kstDayStart_(info.start)) date += ` - ${formatDay_(lastDay)}`;
+  // 삭제된 반복 일정은 저장해 둔 날짜가 첫 회차라 날짜를 빼고 시간만 보여 줍니다.
+  if (kind === 'deleted' && info.recurring) date = '';
+  const when = info.allDay ? '종일' : `${formatClock_(info.start)} - ${formatClock_(info.end)}`;
+  const title = escapeSlack_(info.title);
+  const linked = info.link && kind !== 'deleted' ? `<${info.link}|${title}>` : title;
+  const line = `${date ? `${date} ` : ''}${when} ${linked}${info.recurring ? ' (반복)' : ''}`;
+  return withColor_({
+    text: kind === 'deleted' ? line : withDescription_([line], info),
+    fallback: `${conn.calendarName} · 일정 ${CHANGE_KINDS[kind]} · ${info.title}`,
+    mrkdwn_in: ['pretext', 'text'],
+  }, color);
+}
+
+function calendarStateKey_(calendarId) {
+  return `CS_${hash_(calendarId)}`;
+}
+
+/** 변경 알림을 끈 캘린더의 저장 기록을 지웁니다. 다시 켜면 그때 일정을 새 기준으로 삼습니다. */
+function cleanupCalendarStates_(watched) {
+  const index = loadJson_('CS_INDEX', {});
+  let changed = false;
+  Object.keys(index).forEach((id) => {
+    if (watched[id]) return;
+    deleteChunked_(index[id]);
+    delete index[id];
+    changed = true;
+  });
+  Object.keys(watched).forEach((id) => {
+    if (index[id]) return;
+    index[id] = calendarStateKey_(id);
+    changed = true;
+  });
+  if (changed) saveJson_('CS_INDEX', index);
+}
+
+/** 짧은 해시(비교·키 용도). 보안 용도가 아닙니다. */
+function hash_(text) {
+  let a = 5381;
+  let b = 52711;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    a = (a * 33) ^ c;
+    b = (b * 31) ^ c;
+  }
+  return (a >>> 0).toString(36) + (b >>> 0).toString(36);
+}
+
+// 스크립트 속성은 한 칸에 9KB까지라, 큰 값은 여러 칸에 나눠 저장합니다.
+function loadChunked_(key) {
+  const props = PropertiesService.getScriptProperties();
+  const count = Number(props.getProperty(`${key}#n`) || 0);
+  if (!count) return null;
+  let raw = '';
+  for (let i = 0; i < count; i++) raw += props.getProperty(`${key}#${i}`) || '';
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    return null; // 깨진 기록은 버리고 새로 만듭니다.
+  }
+}
+
+function saveChunked_(key, value) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = JSON.stringify(value);
+  const count = Math.max(1, Math.ceil(raw.length / CHUNK_SIZE));
+  const old = Number(props.getProperty(`${key}#n`) || 0);
+  for (let i = 0; i < count; i++) props.setProperty(`${key}#${i}`, raw.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE));
+  for (let i = count; i < old; i++) props.deleteProperty(`${key}#${i}`);
+  props.setProperty(`${key}#n`, String(count));
+}
+
+function deleteChunked_(key) {
+  const props = PropertiesService.getScriptProperties();
+  const count = Number(props.getProperty(`${key}#n`) || 0);
+  for (let i = 0; i < count; i++) props.deleteProperty(`${key}#${i}`);
+  props.deleteProperty(`${key}#n`);
 }
 
 // ─── 장애 처리 ────────────────────────────────────────────
@@ -1385,6 +1797,17 @@ function describeReminder_(r) {
   return `• *[일정별 알림]* ${when} 발송 | *[종일일정 알림]* ${formatAmPm_(r.allDayTime)}에 발송 | ${describeDays_(r.days)}`;
 }
 
+/** "• [변경 알림] 등록·변경·삭제 | 1분 대기 후 발송 | 지난 일정 알리지 않음" */
+function describeChanges_(c) {
+  if (!c.enabled) return null;
+  const types = Object.keys(CHANGE_KINDS).filter((k) => c.types.includes(k)).map((k) => CHANGE_KINDS[k]).join('·');
+  return `• *[변경 알림]* ${types} | ${changeWaitLabel_(c.wait)} 발송 | 지난 일정 ${c.past ? '알림' : '알리지 않음'}`;
+}
+
+function changeWaitLabel_(wait) {
+  return wait === 0 ? '즉시' : `${wait}분 대기 후`;
+}
+
 function connectionStatus_(conn) {
   // Slack에는 :pause_button: 이름이 없어(⏸는 :double_vertical_bar:) 문자 그대로 넣습니다.
   if (conn.paused) return conn.pausedReason === 'removed' ? '⏸️ 봇이 채널에서 나가 일시정지됨' : '⏸️ 일시정지';
@@ -1408,6 +1831,7 @@ function channelModal_(chId, userId) {
       `*${escapeSlack_(conn.calendarName)}* | ${connectionStatus_(conn)}`,
       describeDaily_(conn.daily),
       describeReminder_(conn.reminder),
+      describeChanges_(changesOf_(conn)),
     ].filter(Boolean).join('\n')); // 꺼 둔 루틴은 줄을 빼고 보여 줍니다.
     blocks.push(summary);
     if (admin) {
@@ -1488,15 +1912,17 @@ function changeCalendarModal_(chId, conn, parentViewId) {
  * 꺼진 루틴은 세부 항목을 숨깁니다. 하루 요약과 일정별 알림은 탭 버튼으로 나눠 한쪽만 보여 줍니다.
  */
 function connModal_(chId, conn, parentViewId, draft) {
-  draft = draft || JSON.parse(JSON.stringify({ daily: conn.daily, reminder: conn.reminder }));
+  draft = draft || JSON.parse(JSON.stringify({ daily: conn.daily, reminder: conn.reminder, changes: changesOf_(conn) }));
+  draft.changes = Object.assign(defaultChanges_(), draft.changes || {});
   const d = draft.daily;
   const r = draft.reminder;
+  const c = draft.changes;
   const problems = draftProblems_(draft);
   const scopes = Object.keys(DAILY_SCOPES).map((k) => option_(DAILY_SCOPES[k], k));
   const empties = [option_('보내지 않음', 'skip'), option_('"일정 없음"으로 보내기', 'send')];
   const offsets = REMINDER_OFFSETS.map((o) => option_(offsetChoiceLabel_(o), o));
 
-  const tab = draft.tab === 'reminder' ? 'reminder' : 'daily';
+  const tab = ['reminder', 'changes'].includes(draft.tab) ? draft.tab : 'daily';
   const tabButton = (name, label, enabled) => {
     const b = button_(`${label} | ${enabled ? '켜짐' : '꺼짐'}`, `tab_${name}`, name);
     if (tab === name) b.style = 'primary';
@@ -1513,12 +1939,21 @@ function connModal_(chId, conn, parentViewId, draft) {
       }),
     }),
     // 탭: 고른 쪽 설정만 보여 줍니다. 숨긴 탭의 값은 draft에 남아 함께 저장됩니다.
-    { type: 'actions', block_id: 'tabs', elements: [tabButton('daily', '📅 하루 요약', d.enabled), tabButton('reminder', '🔔 일정별 알림', r.enabled)] },
+    {
+      type: 'actions',
+      block_id: 'tabs',
+      elements: [
+        tabButton('daily', '📅 하루 요약', d.enabled),
+        tabButton('reminder', '🔔 일정별 알림', r.enabled),
+        tabButton('changes', '✏️ 변경 알림', c.enabled),
+      ],
+    },
   ];
   // 경고는 숨긴 탭의 문제도 보이도록 탭 바로 아래에 둡니다.
-  if (problems.none) blocks.push(context_(':warning: 하루 요약과 일정별 알림 중 하나 이상 켜야 저장됩니다.'));
+  if (problems.none) blocks.push(context_(':warning: 하루 요약, 일정별 알림, 변경 알림 중 하나 이상 켜야 저장됩니다.'));
   if (problems.daily) blocks.push(context_(':warning: 하루 요약의 요일을 하나 이상 고르세요.'));
   if (problems.reminder) blocks.push(context_(':warning: 일정별 알림의 요일을 하나 이상 고르세요.'));
+  if (problems.changes) blocks.push(context_(':warning: 변경 알림의 알림 종류를 하나 이상 고르세요.'));
   blocks.push({ type: 'divider' });
 
   if (tab === 'daily') {
@@ -1531,13 +1966,29 @@ function connModal_(chId, conn, parentViewId, draft) {
         input_('daily_empty', '일정이 없는 날', { type: 'radio_buttons', options: empties, initial_option: findOption_(empties, d.empty) }),
       );
     }
-  } else {
+  } else if (tab === 'reminder') {
     blocks.push(routineHeader_('reminder', '*일정별 알림*\n일정마다 정한 시점에 알립니다. 요일은 일정이 있는 날 기준입니다.', r.enabled));
     if (r.enabled) {
       blocks.push(
         input_('reminder_offset', '시간 일정 알림 시점', select_(offsets, r.offset)),
         timePicker_('reminder_allday_time', '종일 일정 알림 시각', r.allDayTime),
         dayPicker_('reminder', r.days),
+      );
+    }
+  } else {
+    blocks.push(routineHeader_('changes', '*변경 알림*\n일정이 등록·변경·삭제되면 알립니다. 이어서 고치면 마지막 변경 뒤 정한 시간만큼 기다렸다가 최종 내용만 보냅니다.', c.enabled));
+    if (c.enabled) {
+      const kinds = Object.keys(CHANGE_KINDS).map((k) => option_(CHANGE_KINDS[k], k));
+      const kindPicker = { type: 'multi_static_select', options: kinds, placeholder: plain_('알림 종류 고르기') };
+      const picked = kinds.filter((o) => c.types.includes(o.value));
+      if (picked.length) kindPicker.initial_options = picked;
+      const waits = CHANGE_WAITS.map((w) => option_(changeWaitLabel_(w), w));
+      const pasts = [option_('알리지 않음', 'off'), option_('알림', 'on')];
+      blocks.push(
+        input_('changes_types', '알림 종류', kindPicker),
+        input_('changes_wait', '발송 시점', select_(waits, c.wait)),
+        input_('changes_past', '이미 지난 일정', { type: 'radio_buttons', options: pasts, initial_option: findOption_(pasts, c.past ? 'on' : 'off') }),
+        context_('변경 알림을 켠 뒤의 변경부터 알립니다. 비공개 일정은 알리지 않습니다.'),
       );
     }
   }
