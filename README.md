@@ -6,10 +6,10 @@ checky-bot은 여러 Google 공유 캘린더의 일정을 여러 Slack 채널로
 
 1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`. 초대한 사람이 그 채널의 첫 관리자가 됩니다.
 2. 그 채널에서 `/checky`를 입력합니다.
-3. **+ 캘린더 연결**을 누르고 캘린더 ID를 넣습니다. 연결되면 가장 가까운 일정 1개가 나에게만 보이는 메시지로 옵니다.
+3. **+ 캘린더 추가**를 누르고 캘린더 ID를 넣습니다. 연결되면 가장 가까운 일정 1개가 나에게만 보이는 메시지로 옵니다.
 4. 이어서 나오는 알림 설정 화면에서 하루 요약과 일정별 알림을 정합니다.
 
-채널 설정 화면은 봇 프로필의 **[메시지] > 홈** 탭에서 채널 옆 **[설정]** 버튼으로도 열 수 있습니다(그 채널의 관리자만). 채널 설정 화면에서는 연결별 **설정 / 테스트 / 일시정지 / 삭제**와 **관리자 변경**을 할 수 있습니다. 봇 메시지는 메시지의 `⋯` 메뉴 > **checky-bot 메시지 삭제**로 지웁니다. 둘 다 그 채널의 관리자만 할 수 있습니다.
+채널 설정 화면은 봇 프로필의 **[메시지] > 홈** 탭에서 채널 옆 **[설정]** 버튼으로도 열 수 있습니다(그 채널의 관리자만). 채널 설정 화면에서는 연결별 **테스트 메시지 발송 / 일시정지 / 캘린더 변경 / ⚙️ 설정**(삭제는 ⚙️ 설정 화면 맨 위)와 **관리자 변경**을 할 수 있습니다. 봇 메시지는 메시지의 `⋯` 메뉴 > **checky-bot 메시지 삭제**로 지웁니다. 둘 다 그 채널의 관리자만 할 수 있습니다.
 
 ## 설치
 
@@ -30,7 +30,7 @@ https://api.slack.com/apps 에서 기존 앱을 열거나 새로 만듭니다.
    | 권한 | 쓰는 곳 |
    |---|---|
    | `commands` | `/checky` 명령어 |
-   | `chat:write` | 알림, 나에게만 보이는 메시지, 설치자 DM, 메시지 삭제 |
+   | `chat:write` | 알림, 나에게만 보이는 메시지, 앱 관리자 DM, 메시지 삭제 |
    | `users:read` | 게스트·봇 계정 확인 |
    | `channels:read` | 공개 채널 초대·내보내기 감지 |
    | `groups:read` | 비공개 채널 초대·내보내기 감지 |
@@ -65,13 +65,13 @@ Slack이 보내는 명령어와 버튼 요청을 받으려면 배포가 필요�
 | **Slash Commands** | **Create New Command**: Command `/checky`, Request URL은 웹 앱 URL, Short Description `캘린더 알림 설정` |
 | **Interactivity & Shortcuts** | 켜고 Request URL에 웹 앱 URL. **Create New Shortcut > On messages**: Name `checky-bot 메시지 삭제`, Callback ID `delete_message` |
 | **Event Subscriptions** | 켜고 Request URL에 웹 앱 URL(Verified 표시 확인). **Subscribe to bot events**에 `app_home_opened`, `member_joined_channel`, `channel_left`, `group_left` 추가 |
-| **App Home** | **Home Tab**과 **Messages Tab**을 켭니다. Messages Tab이 꺼져 있으면 설치자 DM이 보이지 않습니다. |
+| **App Home** | **Home Tab**과 **Messages Tab**을 켭니다. Messages Tab이 꺼져 있으면 앱 관리자 DM이 보이지 않습니다. |
 
 저장 후 Slack이 재설치를 요청하면 **Reinstall**을 누릅니다.
 
-### 6. 설치자 등록
+### 6. 앱 관리자 등록
 
-Slack 왼쪽 앱 목록에서 checky-bot을 열면(App Home) 처음 연 사람이 **설치자**로 등록됩니다. 설치자는 장애 DM을 받고, App Home에서 다른 사람에게 넘길 수 있습니다. 처음 `/checky`를 실행하거나 봇을 초대한 사람이 먼저 등록될 수도 있습니다.
+Slack 왼쪽 앱 목록에서 checky-bot을 열면(App Home) 처음 연 사람이 **앱 관리자**로 등록됩니다. 앱 관리자는 장애 DM을 받고, App Home의 [변경] 버튼으로 다른 사람에게 넘길 수 있습니다. 처음 `/checky`를 실행하거나 봇을 초대한 사람이 먼저 등록될 수도 있습니다.
 
 ## 코드를 고친 뒤
 
@@ -103,7 +103,7 @@ Slack 왼쪽 앱 목록에서 checky-bot을 열면(App Home) 처음 연 사람�
 - **`/checky`가 "먼저 초대하세요"라고 함:** 그 채널에 봇을 초대합니다. 비공개 채널은 초대가 꼭 필요합니다.
 - **캘린더 연결이 안 됨:** 캘린더를 공용 구글 계정에 공유했는지, ID가 맞는지 확인합니다.
 - **알림이 안 옴:** Apps Script 왼쪽 **실행** 메뉴에서 `dispatchDue`, `rebuildSchedule` 실패 기록을 확인합니다.
-- **설치자 DM이 안 보임:** App Home의 Messages Tab이 켜져 있는지 확인합니다.
+- **앱 관리자 DM이 안 보임:** App Home의 Messages Tab이 켜져 있는지 확인합니다.
 
 ## 테스트
 

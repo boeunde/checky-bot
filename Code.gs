@@ -220,7 +220,7 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
           key: `r|${conn.id}|${info.id}|${info.start}|${i}`,
           group: `r|${conn.id}|${at}|${day}`,
           order: day - 1, // 같은 메시지 안에서 종일 일정을 먼저 적습니다.
-          attachments: [reminderAttachment_(conn, color, info, day, onlyDay === undefined ? at : undefined)],
+          attachments: [reminderAttachment_(conn, color, info, day)],
         });
       }
       return;
@@ -236,7 +236,7 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
       key: `r|${conn.id}|${info.id}|${info.start}`,
       group: `r|${conn.id}|${at}|${day}`,
       order: info.start,
-      attachments: [reminderAttachment_(conn, color, info, day, onlyDay === undefined ? at : undefined)],
+      attachments: [reminderAttachment_(conn, color, info, day)],
     });
   });
   return items;
@@ -382,17 +382,19 @@ function cleanDescription_(html) {
 /*
  * 메시지 모양: 캘린더 이름 줄(머리글)은 색 막대 없이, 일정마다 캘린더 색 막대를 붙입니다.
  *
- *   오늘 | 디자인팀 | 11월 9일 월요일 | 총 2건     ← 머리글 (막대 없음)
- *   ┃ 종일 창립기념일                              ← 일정 (막대, 제목은 일정 링크)
+ *   📅 오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건     ← 하루 요약 머리글 (막대 없음)
+ *   🔔 일정 알림 | 디자인팀 | 총 1건                       ← 일정별 알림 머리글
+ *   ┃ 종일 창립기념일                                    ← 일정 (막대, 제목은 일정 링크)
  *   ┃ 12:00 - 15:00 주간 회의
  *
  * Slack 첨부의 pretext(막대 위 바깥 글자)에 머리글을 넣어 이 모양을 만듭니다.
  * 알림이 늦게 도착할 수 있어 "N분 후" 같은 표현은 쓰지 않습니다.
+ * "총 n건"은 하루 요약은 여기서, 일정별 알림은 한 메시지로 묶을 때(mergeItems_) 붙입니다.
  */
 
-/** 일정별 알림 하나. 일정이 있는 날을 머리글에 적습니다. */
-function reminderAttachment_(conn, color, info, day, sendAt) {
-  return eventAttachment_(conn, color, info, day, `:bell: ${dayHeader_(conn, day, relativeDay_(day, sendAt))}`);
+/** 일정별 알림 하나. "🔔 일정 알림 | 캘린더 이름" */
+function reminderAttachment_(conn, color, info, day) {
+  return eventAttachment_(conn, color, info, day, `:bell: *일정 알림* | ${escapeSlack_(conn.calendarName)}`);
 }
 
 /**
@@ -409,7 +411,7 @@ function dailyAttachments_(day, entries, sendAt) {
       .filter((i) => (i.allDay ? i.start <= day && i.end > day : i.start >= day && i.start < day + DAY))
       .sort((a, b) => (a.allDay === b.allDay ? a.start - b.start : a.allDay ? -1 : 1));
     if (!items.length && conn.daily.empty !== 'send') return;
-    const header = `${dayHeader_(conn, day, relativeDay_(day, sendAt))} | 총 ${items.length}건`;
+    const header = `:date: ${dayHeader_(conn, day, `${relativeDay_(day, sendAt) || '하루'} 요약`)} | 총 ${items.length}건`;
     if (!items.length) {
       attachments.push(withColor_({ pretext: header, text: '일정 없음', fallback: `${conn.calendarName} 일정 없음`, mrkdwn_in: ['pretext', 'text'] }, color));
       return;
@@ -422,9 +424,9 @@ function dailyAttachments_(day, entries, sendAt) {
   return attachments.slice(0, MESSAGE_ATTACHMENT_LIMIT - 1).concat({ text: `외 ${rest}건`, fallback: `외 ${rest}건` });
 }
 
-/** "오늘 | 캘린더 이름 | 11월 9일 월요일" */
-function dayHeader_(conn, day, dayLabel) {
-  return `${dayLabel ? `*${dayLabel}* | ` : ''}*${escapeSlack_(conn.calendarName)}* | ${formatDayLong_(day)}`;
+/** "오늘 요약 | 11월 9일 월요일 | 캘린더 이름" */
+function dayHeader_(conn, day, label) {
+  return `*${label}* | ${formatDayLong_(day)} | ${escapeSlack_(conn.calendarName)}`;
 }
 
 /** 일정 한 줄(+설명)에 캘린더 색 막대를 붙인 첨부. pretext는 막대 위에 막대 없이 표시됩니다. */
@@ -590,7 +592,7 @@ function onBotJoined_(chId, inviter) {
   if (ch && ch.admins.length) {
     // 다시 초대된 경우: 나갈 때 일시정지된 연결이 있으면 재개 방법을 알려 줍니다.
     if (inviter && ch.connections.some((c) => c.pausedReason === 'removed')) {
-      postEphemeral_(chId, inviter, '봇이 나가 있던 동안 이 채널의 연결이 일시정지되었습니다. 채널 관리자가 `/checky`에서 재개할 수 있습니다.');
+      postEphemeral_(chId, inviter, '봇이 나가 있던 동안 이 채널의 연결이 일시정지되었습니다. 채널 관리자가 `/checky`에서 [다시 시작]을 누르면 됩니다.');
     }
     return;
   }
@@ -690,6 +692,9 @@ function handleBlockAction_(payload, userId) {
     case 'edit_conn':
       if (conn) slackApi_('views.push', { trigger_id: payload.trigger_id, view: connModal_(chId, conn, view.id) });
       return;
+    case 'change_calendar':
+      if (conn) slackApi_('views.push', { trigger_id: payload.trigger_id, view: changeCalendarModal_(chId, conn, view.id) });
+      return;
     case 'edit_admins':
       slackApi_('views.push', { trigger_id: payload.trigger_id, view: adminsModal_(chId, ch, view.id) });
       return;
@@ -704,7 +709,7 @@ function handleBlockAction_(payload, userId) {
         target.paused = !target.paused;
         target.pausedReason = target.paused ? 'manual' : null;
         target.updatedAt = Date.now();
-        addLog_(c, userId, `${target.paused ? '일시정지' : '재개'}: ${escapeSlack_(target.calendarName)}`);
+        addLog_(c, userId, `${target.paused ? '일시정지' : '다시 시작'}: ${escapeSlack_(target.calendarName)}`);
       });
       break;
     case 'delete_conn':
@@ -713,7 +718,15 @@ function handleBlockAction_(payload, userId) {
         c.connections = c.connections.filter((x) => x.id !== conn.id);
         addLog_(c, userId, `연결 삭제: ${escapeSlack_(conn.calendarName)}`);
       });
-      break;
+      invalidateSchedule_();
+      // 삭제 버튼은 ⚙️ 설정 화면(위에 쌓인 창)에 있습니다. 아래 채널 화면을 새로 고치고, 설정 화면은 안내로 바꿉니다.
+      if (meta.parentViewId) {
+        updateView_(meta.parentViewId, channelModal_(chId, userId));
+        updateView_(view.id, noticeModal_('알림 설정', `*${escapeSlack_(conn.calendarName)}* 연결을 삭제했습니다.`));
+      } else {
+        updateView_(view.id, channelModal_(chId, userId));
+      }
+      return;
     default:
       return;
   }
@@ -729,7 +742,7 @@ function handleSubmission_(payload, userId) {
     if (view.callback_id === 'installer') return submitInstaller_(values, userId);
     if (view.callback_id === 'delete_message') return submitDeleteMessage_(meta, userId);
     const ch = loadChannel_(meta.channelId);
-    const firstBlock = { add_conn: 'calendar_id', conn_settings: 'notice', admins: 'admins' }[view.callback_id];
+    const firstBlock = { add_conn: 'calendar_id', change_calendar: 'calendar_id', conn_settings: 'notice', admins: 'admins' }[view.callback_id];
     if (!firstBlock) return null;
     if (!isAdmin_(ch, userId)) {
       if (view.callback_id === 'conn_settings') return json_({ response_action: 'update', view: noticeModal_('알림 설정', '이 채널의 관리자만 바꿀 수 있습니다.') });
@@ -737,11 +750,12 @@ function handleSubmission_(payload, userId) {
     }
     if (view.callback_id === 'add_conn') return submitAddConn_(meta, ch, values, userId);
     if (view.callback_id === 'conn_settings') return submitConnSettings_(meta, ch, values, userId);
+    if (view.callback_id === 'change_calendar') return submitChangeCalendar_(meta, ch, values, userId);
     return submitAdmins_(meta, ch, values, userId);
   } catch (err) {
     console.error(err && err.stack ? err.stack : err);
     if (view.callback_id === 'conn_settings') return json_({ response_action: 'update', view: noticeModal_('알림 설정', `처리하지 못했습니다: ${err.message}`) });
-    const block = { add_conn: 'calendar_id', admins: 'admins', installer: 'installer' }[view.callback_id];
+    const block = { add_conn: 'calendar_id', change_calendar: 'calendar_id', admins: 'admins', installer: 'installer' }[view.callback_id];
     return block ? errorsJson_({ [block]: `처리하지 못했습니다: ${err.message}` }) : null;
   }
 }
@@ -768,6 +782,45 @@ function submitAddConn_(meta, ch, values, userId) {
   sendConnectionPreview_(meta.channelId, conn, calendar, userId);
   // 연결 직후 바로 알림 설정 화면을 보여 줍니다. 저장하면 채널 설정 화면도 새로 고칩니다.
   return json_({ response_action: 'update', view: connModal_(meta.channelId, conn, meta.parentViewId) });
+}
+
+/**
+ * 연결의 캘린더만 바꿉니다. 알림 설정과 일시정지 상태는 그대로 둡니다.
+ * 새 캘린더의 변경 감지 트리거는 10분마다 도는 rebuildSchedule이 맞춥니다.
+ */
+function submitChangeCalendar_(meta, ch, values, userId) {
+  const conn = ch.connections.find((c) => c.id === meta.connId);
+  if (!conn) return errorsJson_({ calendar_id: '이 연결은 이미 삭제되었습니다.' });
+  const calendarId = (values.calendar_id.v.value || '').trim();
+  if (!calendarId) return errorsJson_({ calendar_id: '캘린더 ID를 입력하세요.' });
+  if (calendarId === conn.calendarId) return null; // 바뀐 게 없으면 그냥 닫습니다.
+  if (ch.connections.some((c) => c.calendarId === calendarId)) {
+    return errorsJson_({ calendar_id: '이 채널에 이미 연결된 캘린더입니다.' });
+  }
+  const calendar = openCalendar_(calendarId);
+  if (!calendar) {
+    return errorsJson_({
+      calendar_id: `공용 구글 계정(${accountEmail_()})이 볼 수 없는 캘린더입니다. 캘린더를 이 계정에 공유했는지, ID가 맞는지 확인하세요.`,
+    });
+  }
+
+  let changed = null;
+  updateChannel_(meta.channelId, (c) => {
+    const target = c.connections.find((x) => x.id === conn.id);
+    if (!target) return;
+    const before = target.calendarName;
+    target.calendarId = calendarId;
+    target.calendarName = calendar.getName();
+    target.error = null;
+    target.updatedAt = Date.now();
+    addLog_(c, userId, `캘린더 변경: ${escapeSlack_(before)} → ${escapeSlack_(target.calendarName)}`);
+    changed = target;
+  });
+  if (!changed) return errorsJson_({ calendar_id: '이 연결은 이미 삭제되었습니다.' });
+  invalidateSchedule_();
+  sendConnectionPreview_(meta.channelId, changed, calendar, userId);
+  refreshParent_(meta.parentViewId, meta.channelId, userId);
+  return null;
 }
 
 /**
@@ -858,10 +911,10 @@ function submitAdmins_(meta, ch, values, userId) {
 
 function submitInstaller_(values, userId) {
   const next = values.installer.v.selected_user;
-  if (loadMeta_().installer !== userId) return errorsJson_({ installer: '현재 설치자만 바꿀 수 있습니다.' });
-  if (!next) return errorsJson_({ installer: '새 설치자를 고르세요.' });
+  if (loadMeta_().installer !== userId) return errorsJson_({ installer: '현재 앱 관리자만 바꿀 수 있습니다.' });
+  if (!next) return errorsJson_({ installer: '새 앱 관리자를 고르세요.' });
   const reason = ineligibleReason_(next);
-  if (reason) return errorsJson_({ installer: `${reason}은(는) 설치자가 될 수 없습니다.` });
+  if (reason) return errorsJson_({ installer: `${reason}은(는) 앱 관리자가 될 수 없습니다.` });
   withLock_(() => {
     const meta = loadMeta_();
     meta.installer = next;
@@ -944,12 +997,13 @@ function sendConnectionPreview_(chId, conn, calendar, userId) {
   }
   const index = next.allDay ? Math.max(0, Math.round((kstDayStart_(now) - next.start) / DAY)) : 0;
   const day = next.allDay ? next.start + index * DAY : kstDayStart_(next.start);
-  postEphemeral_(chId, userId, `${head}\n가장 가까운 일정:`, [reminderAttachment_(conn, calendarColor_(calendar), next, day, now)]);
+  postEphemeral_(chId, userId, `${head}\n가장 가까운 일정:`, [reminderAttachment_(conn, calendarColor_(calendar), next, day)]);
 }
 
 /** 일정이 있었던 가장 최근 지난 하루를 현재 설정 형식으로, 누른 관리자에게만 보여 줍니다. */
 function runTest_(chId, conn, userId) {
-  const say = (text, routine, attachments) => postEphemeral_(chId, userId, `[테스트${routine ? ` · ${routine}` : ''}] ${text}`.trim(), attachments);
+  // 실제 알림과 같은 모양으로 보냅니다. 나에게만 보이는 메시지라 "[테스트]" 같은 표시는 붙이지 않습니다.
+  const say = (text, attachments) => postEphemeral_(chId, userId, text, attachments);
   const name = escapeSlack_(conn.calendarName);
   const calendar = openCalendar_(conn.calendarId);
   if (!calendar) {
@@ -985,8 +1039,8 @@ function runTest_(chId, conn, userId) {
       .sort((a, b) => a.at - b.at)
       .forEach((item) => messages.push({ routine: '일정별 알림', text: '', attachments: item.attachments }));
   }
-  say(`*${formatDay_(day)}* 일정으로 *${name}* 알림을 미리 보여 드립니다. 켜 둔 루틴마다 따로 오며, 요일 설정과 관계없이 보여 줍니다.`);
-  messages.slice(0, TEST_MESSAGE_LIMIT).forEach((m) => say(m.text, m.routine, m.attachments));
+  say(`*${name}*, *${formatDay_(day)}* 에 등록된 일정입니다.`);
+  messages.slice(0, TEST_MESSAGE_LIMIT).forEach((m) => say(m.text, m.attachments));
   if (messages.length > TEST_MESSAGE_LIMIT) say(`외 ${messages.length - TEST_MESSAGE_LIMIT}건은 생략했습니다.`);
 }
 
@@ -1026,7 +1080,7 @@ function pauseChannelForRemoval_(chId) {
     addLog_(c, null, '봇이 채널에서 나가 모든 연결을 일시정지함');
   });
   invalidateSchedule_();
-  notifyInstaller_(`:pause_button: checky-bot이 <#${chId}> 채널에서 나가, 이 채널의 연결 ${targets.length}개를 일시정지했습니다. 봇을 다시 초대한 뒤 채널 관리자가 \`/checky\`에서 재개하세요.`);
+  notifyInstaller_(`⏸️ checky-bot이 <#${chId}> 채널에서 나가, 이 채널의 연결 ${targets.length}개를 일시정지했습니다. 봇을 다시 초대한 뒤 채널 관리자가 \`/checky\`에서 [다시 시작]을 누르세요.`);
 }
 
 function notifyInstaller_(text) {
@@ -1318,18 +1372,22 @@ function offsetChoiceLabel_(offset) {
   return `${offset}분 전`;
 }
 
+/** "• [하루 요약] 오후 6:10에 발송 | 모든 일정 | 평일 | 일정 없음 표시 안 함" */
 function describeDaily_(d) {
-  if (!d.enabled) return '끔';
-  return `${formatAmPm_(d.time)} · ${DAILY_SCOPES[d.scope]} · ${describeDays_(d.days)} · 일정 없는 날 ${d.empty === 'send' ? '"일정 없음" 보냄' : '안 보냄'}`;
+  if (!d.enabled) return null;
+  return `• *[하루 요약]* ${formatAmPm_(d.time)}에 발송 | ${DAILY_SCOPES[d.scope]} | ${describeDays_(d.days)} | ${d.empty === 'send' ? '일정 없음 표시함' : '일정 없음 표시 안 함'}`;
 }
 
+/** "• [일정별 알림] 시작 시간에 발송 | [종일일정 알림] 오후 6:12에 발송 | 평일" */
 function describeReminder_(r) {
-  if (!r.enabled) return '끔';
-  return `${offsetChoiceLabel_(r.offset)} · 종일 일정 ${formatAmPm_(r.allDayTime)} · ${describeDays_(r.days)}`;
+  if (!r.enabled) return null;
+  const when = r.offset === 0 ? '시작 시간에' : `${offsetChoiceLabel_(r.offset)}`;
+  return `• *[일정별 알림]* ${when} 발송 | *[종일일정 알림]* ${formatAmPm_(r.allDayTime)}에 발송 | ${describeDays_(r.days)}`;
 }
 
 function connectionStatus_(conn) {
-  if (conn.paused) return conn.pausedReason === 'removed' ? ':pause_button: 봇이 채널에서 나가 일시정지됨' : ':pause_button: 일시정지';
+  // Slack에는 :pause_button: 이름이 없어(⏸는 :double_vertical_bar:) 문자 그대로 넣습니다.
+  if (conn.paused) return conn.pausedReason === 'removed' ? '⏸️ 봇이 채널에서 나가 일시정지됨' : '⏸️ 일시정지';
   if (conn.error === 'calendar') return ':warning: 캘린더 접근 불가';
   return ':large_green_circle: 알림 중';
 }
@@ -1341,41 +1399,46 @@ function formatLog_(entry) {
 function channelModal_(chId, userId) {
   const ch = loadChannel_(chId) || newChannel_(chId);
   const admin = isAdmin_(ch, userId);
-  const blocks = [section_(`*<#${chId}>* 채널 알림 설정`)];
+  // 채널 이름 / 연결마다 / 캘린더 추가 버튼 / 관리자 / 최근 변경을 구분선으로 나눕니다.
+  const blocks = [section_(`*<#${chId}>* 채널 알림 설정`), { type: 'divider' }];
 
-  if (!ch.connections.length) blocks.push(context_('연결된 캘린더가 없습니다.'));
+  if (!ch.connections.length) blocks.push(context_('연결된 캘린더가 없습니다.'), { type: 'divider' });
   ch.connections.forEach((conn) => {
-    blocks.push(section_([
-      `*${escapeSlack_(conn.calendarName)}*  ·  ${connectionStatus_(conn)}`,
-      `하루 요약: ${describeDaily_(conn.daily)}`,
-      `일정별 알림: ${describeReminder_(conn.reminder)}`,
-    ].join('\n')));
+    const summary = section_([
+      `*${escapeSlack_(conn.calendarName)}* | ${connectionStatus_(conn)}`,
+      describeDaily_(conn.daily),
+      describeReminder_(conn.reminder),
+    ].filter(Boolean).join('\n')); // 꺼 둔 루틴은 줄을 빼고 보여 줍니다.
+    blocks.push(summary);
     if (admin) {
+      // 삭제는 실수로 누르지 않게 ⚙️ 설정 화면 맨 아래에 둡니다.
       blocks.push({
         type: 'actions',
         elements: [
-          button_('설정', 'edit_conn', conn.id),
-          button_('테스트', 'test_conn', conn.id),
-          button_(conn.paused ? '재개' : '일시정지', 'toggle_conn', conn.id),
-          Object.assign(button_('삭제', 'delete_conn', conn.id), {
-            style: 'danger',
-            confirm: confirm_('연결 삭제', `${conn.calendarName} 연결을 삭제할까요? 알림 설정도 함께 지워집니다.`, '삭제'),
-          }),
+          button_('테스트 메시지 발송', 'test_conn', conn.id),
+          button_(conn.paused ? '다시 시작' : '일시정지', 'toggle_conn', conn.id),
+          button_('캘린더 변경', 'change_calendar', conn.id),
+          button_('⚙️ 설정', 'edit_conn', conn.id),
         ],
       });
     }
+    blocks.push({ type: 'divider' });
   });
   if (admin) {
-    if (ch.connections.length) blocks.push(context_('테스트 결과는 이 채널에 나에게만 보이는 메시지로 옵니다.'));
-    blocks.push({ type: 'actions', elements: [Object.assign(button_('+ 캘린더 연결', 'add_conn', 'add'), { style: 'primary' })] });
+    // Slack 버튼은 너비·정렬을 정할 수 없어, 빈 줄로 위아래 여백만 줍니다.
+    blocks.push(
+      section_('\n　\n'),
+      { type: 'actions', elements: [Object.assign(button_('+ 캘린더 추가', 'add_conn', 'add'), { style: 'primary' })] },
+      section_('\n　\n'),
+      { type: 'divider' },
+    );
   }
 
-  blocks.push({ type: 'divider' });
-  const admins = section_(`*관리자*  ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
-  if (admin) admins.accessory = button_('관리자 변경', 'edit_admins', 'admins');
+  const admins = section_(`*채널봇 관리자*\n${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
+  if (admin) admins.accessory = button_('변경', 'edit_admins', 'admins');
   blocks.push(admins);
   if (!admin) blocks.push(context_('설정은 이 채널의 관리자만 바꿀 수 있습니다.'));
-  if (ch.log.length) blocks.push(context_(`*최근 변경*\n${ch.log.slice(0, 5).map(formatLog_).join('\n')}`));
+  if (ch.log.length) blocks.push({ type: 'divider' }, context_(`*최근 변경*\n${ch.log.slice(0, 5).map(formatLog_).join('\n')}`));
 
   return {
     type: 'modal',
@@ -1391,13 +1454,30 @@ function addConnModal_(chId, parentViewId) {
   return {
     type: 'modal',
     callback_id: 'add_conn',
-    title: plain_('캘린더 연결'),
-    submit: plain_('연결'),
+    title: plain_('캘린더 추가'),
+    submit: plain_('추가'),
     close: plain_('취소'),
     private_metadata: JSON.stringify({ channelId: chId, parentViewId }),
     blocks: [
       input_('calendar_id', '캘린더 ID', { type: 'plain_text_input', placeholder: plain_('예: abc123@group.calendar.google.com') }),
       context_(`공용 구글 계정 *${accountEmail_()}* 에 캘린더를 공유한 뒤, 구글 캘린더의 설정 및 공유 > 캘린더 통합에 있는 캘린더 ID를 넣으세요.`),
+    ],
+  };
+}
+
+/** 캘린더 이름 버튼을 누르면 여는 화면. 지금 캘린더 ID를 채워 둡니다. */
+function changeCalendarModal_(chId, conn, parentViewId) {
+  return {
+    type: 'modal',
+    callback_id: 'change_calendar',
+    title: plain_('캘린더 변경'),
+    submit: plain_('변경'),
+    close: plain_('취소'),
+    private_metadata: JSON.stringify({ channelId: chId, connId: conn.id, parentViewId }),
+    blocks: [
+      section_(`지금 연결: *${escapeSlack_(conn.calendarName)}*`),
+      input_('calendar_id', '캘린더 ID', { type: 'plain_text_input', initial_value: conn.calendarId }),
+      context_(`알림 설정은 그대로 두고 캘린더만 바꿉니다. 새 캘린더는 공용 구글 계정 *${accountEmail_()}* 에 공유돼 있어야 합니다.`),
     ],
   };
 }
@@ -1418,14 +1498,22 @@ function connModal_(chId, conn, parentViewId, draft) {
 
   const tab = draft.tab === 'reminder' ? 'reminder' : 'daily';
   const tabButton = (name, label, enabled) => {
-    const b = button_(`${label} · ${enabled ? '켜짐' : '꺼짐'}`, `tab_${name}`, name);
+    const b = button_(`${label} | ${enabled ? '켜짐' : '꺼짐'}`, `tab_${name}`, name);
     if (tab === name) b.style = 'primary';
     return b;
   };
   const blocks = [
-    section_(`*${escapeSlack_(conn.calendarName)}* → <#${chId}>`),
+    // 맨 위 "캘린더 → 채널" 줄 오른쪽에 [연결 삭제]를 둡니다. Slack 모달 아래쪽 [닫기]/[저장] 영역에는
+    // 버튼을 더할 수 없고, 글자 링크로는 봇 동작을 실행할 수 없어 버튼으로 붙입니다.
+    Object.assign(section_(`*${escapeSlack_(conn.calendarName)}* → <#${chId}>`), {
+      block_id: 'danger',
+      accessory: Object.assign(button_('연결 삭제', 'delete_conn', conn.id), {
+        style: 'danger',
+        confirm: confirm_('연결 삭제', `${conn.calendarName} 연결을 삭제할까요? 알림 설정도 함께 지워지며 되돌릴 수 없습니다.`, '삭제'),
+      }),
+    }),
     // 탭: 고른 쪽 설정만 보여 줍니다. 숨긴 탭의 값은 draft에 남아 함께 저장됩니다.
-    { type: 'actions', block_id: 'tabs', elements: [tabButton('daily', '하루 요약', d.enabled), tabButton('reminder', '일정별 알림', r.enabled)] },
+    { type: 'actions', block_id: 'tabs', elements: [tabButton('daily', '📅 하루 요약', d.enabled), tabButton('reminder', '🔔 일정별 알림', r.enabled)] },
   ];
   // 경고는 숨긴 탭의 문제도 보이도록 탭 바로 아래에 둡니다.
   if (problems.none) blocks.push(context_(':warning: 하루 요약과 일정별 알림 중 하나 이상 켜야 저장됩니다.'));
@@ -1459,7 +1547,7 @@ function connModal_(chId, conn, parentViewId, draft) {
     callback_id: 'conn_settings',
     title: plain_('알림 설정'),
     submit: plain_('저장'),
-    close: plain_('닫기'),
+    close: plain_('취소'),
     private_metadata: JSON.stringify({ channelId: chId, connId: conn.id, parentViewId, draft }),
     blocks,
   };
@@ -1491,14 +1579,14 @@ function adminsModal_(chId, ch, parentViewId) {
   return {
     type: 'modal',
     callback_id: 'admins',
-    title: plain_('관리자 변경'),
+    title: plain_('채널 봇 관리자 변경'),
     submit: plain_('저장'),
     close: plain_('취소'),
     private_metadata: JSON.stringify({ channelId: chId, parentViewId }),
     blocks: [
-      section_(`<#${chId}> 채널의 관리자`),
-      input_('admins', '관리자', { type: 'multi_users_select', initial_users: ch.admins }),
-      context_('관리자는 이 채널의 캘린더 연결과 알림 설정을 바꿀 수 있습니다. 게스트 계정과 봇은 관리자가 될 수 없습니다.'),
+      section_(`<#${chId}> 채널의 봇 관리자`),
+      input_('admins', '채널 봇 관리자', { type: 'multi_users_select', initial_users: ch.admins }),
+      context_('채널 봇 관리자는 이 채널의 캘린더 연결과 알림 설정을 바꿀 수 있습니다. 게스트 계정과 봇은 채널 봇 관리자가 될 수 없습니다.'),
     ],
   };
 }
@@ -1533,12 +1621,14 @@ function installerModal_(userId) {
   return {
     type: 'modal',
     callback_id: 'installer',
-    title: plain_('설치자 변경'),
+    title: plain_('앱 관리자 변경'),
     submit: plain_('저장'),
     close: plain_('취소'),
     blocks: [
-      input_('installer', '새 설치자', { type: 'users_select', initial_user: userId }),
-      context_('설치자는 장애가 생기면 DM을 받습니다.'),
+      input_('installer', '앱 관리자', { type: 'users_select', initial_user: userId }),
+      context_('서비스에 문제가 생기면 앱 관리자에게 DM이 발송됩니다.'),
+      { type: 'divider' },
+      context_('<https://github.com/boeunde/checky-bot|github.com/boeunde/checky-bot>　|　MIT License'),
     ],
   };
 }
@@ -1546,13 +1636,17 @@ function installerModal_(userId) {
 function publishHome_(userId) {
   const meta = loadMeta_();
   const blocks = [
-    { type: 'header', text: plain_('checky-bot') },
-    section_('공용 Google 캘린더의 일정을 Slack 채널로 알려 드립니다.\n1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`\n2. 그 채널에서 `/checky`를 입력해 캘린더를 연결합니다.'),
+    section_('\n　\n공용 Google 캘린더의 일정을 Slack 채널로 발송합니다.\n　\n'),
     { type: 'divider' },
+    section_([
+      '\n　\n*사용 방법*',
+      '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`',
+      '2. 해당 채널에서 `/checky` 명령어를 입력하고 캘린더를 연결합니다.',
+      '3. 캘린더마다 알림 루틴을 설정합니다.\n　\n',
+    ].join('\n')),
+    { type: 'divider' },
+    section_('\n　\n*연결된 채널*\n현재 연결된 채널과 그에 따른 설정은 다음과 같습니다.\n　\n'),
   ];
-  const installer = section_(`*설치자*  ${meta.installer ? `<@${meta.installer}>` : '아직 없음'}\n장애가 생기면 설치자에게 DM이 갑니다.`);
-  if (meta.installer === userId) installer.accessory = button_('설치자 변경', 'transfer_installer', 'installer');
-  blocks.push(installer, { type: 'divider' }, section_('*채널*'));
 
   // 캘린더가 연결된 채널과 내가 관리자인 채널을 보여 주고, 관리자인 채널에는 [설정] 버튼을 붙입니다.
   const channels = meta.channels
@@ -1560,12 +1654,16 @@ function publishHome_(userId) {
     .filter((ch) => ch && (ch.connections.length || isAdmin_(ch, userId)))
     .slice(0, HOME_CHANNEL_LIMIT);
   channels.forEach((ch) => {
-    const row = section_(`<#${ch.id}>  캘린더 ${ch.connections.length}개 · 관리자 ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
+    const row = section_(`　●　<#${ch.id}>　|　캘린더 ${ch.connections.length}개　|　채널봇 관리자 ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
     if (isAdmin_(ch, userId)) row.accessory = button_('설정', 'open_channel', ch.id);
     blocks.push(row);
   });
-  blocks.push(channels.length
-    ? context_('설정은 각 채널의 관리자만 열 수 있습니다. 채널에서 `/checky`를 입력해도 됩니다.')
-    : context_('아직 캘린더를 연결한 채널이 없습니다.'));
+  if (!channels.length) blocks.push(context_('아직 캘린더를 연결한 채널이 없습니다.'));
+
+  // 앱 관리자(설치자)는 채널 목록 아래에 둡니다.
+  blocks.push({ type: 'divider' }, section_('\n　\n*앱 관리자*\n서비스에 문제가 생기면 앱 관리자에게 DM이 발송됩니다.\n　\n'));
+  const installer = section_(`${meta.installer ? `　●　<@${meta.installer}>` : '아직 없음'}`);
+  if (meta.installer === userId) installer.accessory = button_('변경', 'transfer_installer', 'installer');
+  blocks.push(installer, { type: 'divider' });
   slackApi_('views.publish', { user_id: userId, view: { type: 'home', blocks } });
 }
