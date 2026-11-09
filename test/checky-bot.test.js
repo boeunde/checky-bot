@@ -209,6 +209,7 @@ function flatten(call) {
   (call.params.attachments || []).forEach((a) => {
     if (a.pretext) parts.push(a.pretext);
     parts.push(a.text);
+    if (a.footer) parts.push(a.footer);
   });
   return parts.join('\n').replace(/<https?:[^|>]+\|([^>]+)>/g, '$1').trim();
 }
@@ -556,11 +557,12 @@ const tests = {
     env.run('dispatchDue');
     const [post] = env.rawPosts('C1');
     assert.strictEqual(env.rawPosts('C1').length, 1);
-    const texts = post.attachments.map((a) => a.text);
-    assert.strictEqual(texts.length, 2);
-    const meeting = texts.find((t) => t.includes('공개 회의'));
-    assert.ok(meeting.includes('> 회의실 &amp; 링크') && !meeting.includes('<p>'), meeting);
-    assert.ok(texts.find((t) => t.includes('긴 설명')).includes(`${'a'.repeat(300)}…`));
+    assert.strictEqual(post.attachments.length, 2);
+    const byTitle = (t) => post.attachments.find((a) => a.text.includes(t));
+    const meeting = byTitle('공개 회의');
+    assert.strictEqual(meeting.footer, '회의실 &amp; 링크', 'description goes to the small gray footer, not a quote');
+    assert.ok(!meeting.text.includes('>') || meeting.text.includes('<https'), meeting.text);
+    assert.strictEqual(byTitle('긴 설명').footer, `${'a'.repeat(299)}…`, 'footer is capped at 300 characters');
   },
 
   'daily summary respects scope and the empty-day option': () => {
@@ -800,7 +802,7 @@ const tests = {
     dispatchAt('2026-11-09T10:06');
     assert.strictEqual(env.posts('C1').length, 0, 'still waiting after the last edit');
     dispatchAt('2026-11-09T10:07');
-    assert.deepStrictEqual(env.posts('C1'), ['🆕 *일정 등록* | 디자인팀 | 총 1건\n11월 12일 (목) 14:00 - 15:00 주간 회의 (수정)\n> 3층']);
+    assert.deepStrictEqual(env.posts('C1'), ['🆕 *일정 등록* | 디자인팀 | 총 1건\n11월 12일 (목) 14:00 - 15:00 주간 회의 (수정)\n3층']);
     assert.ok(env.rawPosts('C1')[0].attachments[0].text.includes('<https://calendar.example/n1|'), 'title links to the event');
 
     env.setNow('2026-11-09T10:10');

@@ -450,11 +450,11 @@ function eventAttachment_(conn, color, info, day, pretext) {
   const title = escapeSlack_(info.title);
   const linked = info.link ? `<${info.link}|${title}>` : title;
   const line = `${when} ${linked}${info.allDay ? partLabel_(info, index) : ''}`;
-  const attachment = {
-    text: withDescription_([line], info),
+  const attachment = withDescription_({
+    text: line,
     fallback: `${conn.calendarName} · ${when} ${info.title}`,
     mrkdwn_in: ['pretext', 'text'],
-  };
+  }, info);
   if (pretext) attachment.pretext = pretext;
   return withColor_(attachment, color);
 }
@@ -480,13 +480,16 @@ function calendarColor_(calendar) {
   }
 }
 
-function withDescription_(lines, info) {
-  if (info.description) lines.push(quote_(info.description));
-  return lines.join('\n');
-}
-
-function quote_(text) {
-  return text.split('\n').map((line) => `> ${escapeSlack_(line)}`).join('\n');
+/**
+ * 설명은 첨부의 footer(색 막대 안 아래쪽의 작은 회색 글씨)에 넣습니다.
+ * 인용(>)을 쓰면 색 막대 안에 세로줄이 하나 더 생겨서 쓰지 않습니다. footer는 300자까지입니다.
+ */
+function withDescription_(attachment, info) {
+  if (info.description) {
+    const text = escapeSlack_(info.description);
+    attachment.footer = text.length > 300 ? `${text.slice(0, 299)}…` : text;
+  }
+  return attachment;
 }
 
 function partLabel_(info, index) {
@@ -1384,12 +1387,13 @@ function changeAttachment_(conn, color, kind, info) {
   const title = escapeSlack_(info.title);
   const linked = info.link && kind !== 'deleted' ? `<${info.link}|${title}>` : title;
   const line = `${date ? `${date} ` : ''}${when} ${linked}${info.recurring ? ' (반복)' : ''}`;
-  return withColor_({
+  const attachment = {
     // 삭제된 일정은 날짜·시간·제목 줄 전체에 취소선을 긋습니다.
-    text: kind === 'deleted' ? `~${line}~` : withDescription_([line], info),
+    text: kind === 'deleted' ? `~${line}~` : line,
     fallback: `${conn.calendarName} · 일정 ${CHANGE_KINDS[kind]} · ${info.title}`,
     mrkdwn_in: ['pretext', 'text'],
-  }, color);
+  };
+  return withColor_(kind === 'deleted' ? attachment : withDescription_(attachment, info), color);
 }
 
 function calendarStateKey_(calendarId) {
