@@ -186,8 +186,8 @@ function addConnection(env, calendarId, user = 'UA') {
   });
 }
 
-function configure(env, settings, user = 'UA') {
-  const connId = env.channel('C1').connections[0].id;
+function configure(env, settings, user = 'UA', index = 0) {
+  const connId = env.channel('C1').connections[index].id;
   return env.interact({
     type: 'view_submission',
     user: { id: user },
@@ -319,7 +319,9 @@ const tests = {
     env.setNow('2026-11-09T10:16');
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1);
-    assert.ok(env.posts('C1')[0].includes('15분 후 시작') && env.posts('C1')[0].includes('10:30 - 11:00'));
+    const text = env.posts('C1')[0];
+    assert.ok(text.includes('*디자인팀*  디자인 리뷰') && text.includes('11월 9일 (월) 10:30 - 11:00'), text);
+    assert.ok(!/분 후/.test(text), text);
 
     event.start = kst('2026-11-09T10:40');
     event.end = kst('2026-11-09T11:10');
@@ -379,7 +381,7 @@ const tests = {
     timed.setNow('2026-11-09T09:00');
     timed.run('dispatchDue');
     const summary = timed.posts('C1')[0];
-    assert.ok(summary.includes('11월 9일 (월) 일정 1건') && summary.includes('14:00 - 15:00  주간 회의') && !summary.includes('창립기념일'), summary);
+    assert.ok(summary.includes('11월 9일 (월) 일정') && summary.includes('*디자인팀*  일정 1개') && summary.includes('14:00 - 15:00  주간 회의') && !summary.includes('창립기념일'), summary);
 
     const skip = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'skip' } });
     skip.setNow('2026-11-10T09:00');
@@ -389,7 +391,39 @@ const tests = {
     const send = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'send' } });
     send.setNow('2026-11-10T09:00');
     send.run('dispatchDue');
-    assert.ok(send.posts('C1')[0].includes('일정 없음'));
+    assert.ok(send.posts('C1')[0].includes('*디자인팀*  일정 없음'));
+  },
+
+  'daily summaries for the same channel and time are grouped by calendar in one message': () => {
+    const env = connectedEnv('2026-11-09T08:40', [ev('a1', 'A 회의', '2026-11-09T10:00', '2026-11-09T11:00'), ev('a2', 'A 리뷰', '2026-11-09T15:00', '2026-11-09T16:00')]);
+    env.addCalendar('cal2', '개발팀', [ev('b1', 'B 배포', '2026-11-09T13:00', '2026-11-09T14:00')]);
+    env.addCalendar('cal3', '전사', [ev('c1', '전사 공지', '2026-11-09T17:00', '2026-11-09T18:00')]);
+    addConnection(env, 'cal2');
+    addConnection(env, 'cal3');
+    configure(env, {}, 'UA', 0);
+    configure(env, {}, 'UA', 1);
+    configure(env, { daily: { time: 600 } }, 'UA', 2); // 10:00, a separate message
+    env.setNow('2026-11-09T09:00');
+    env.run('dispatchDue');
+    const nine = env.posts('C1');
+    assert.strictEqual(nine.length, 1);
+    const text = nine[0];
+    assert.ok(text.indexOf('*디자인팀*  일정 2개') < text.indexOf('*개발팀*  일정 1개'), text);
+    assert.ok(text.includes('A 회의') && text.includes('A 리뷰') && text.includes('B 배포') && !text.includes('전사 공지'), text);
+    env.setNow('2026-11-09T10:00');
+    env.run('rebuildSchedule');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 2);
+    assert.ok(env.posts('C1')[1].includes('*전사*  일정 1개'));
+  },
+
+  'a reminder that would arrive more than 5 minutes after the start is dropped': () => {
+    const env = connectedEnv('2026-11-09T09:50', [], { daily: { enabled: false }, reminder: { enabled: true, offset: 0 } });
+    env.state.calendars.cal1.events.push(ev('e1', '늦게 만든 일정', '2026-11-09T10:00', '2026-11-09T10:30'));
+    env.setNow('2026-11-09T10:06');
+    env.run('onCalendarChanged');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 0);
   },
 
   'paused connections and alerts before the last settings change are not sent': () => {
@@ -459,10 +493,10 @@ const tests = {
     const env = connectedEnv('2026-11-09T10:00', events, { reminder: { enabled: true } });
     blockAction(env, 'test_conn', env.channel('C1').connections[0].id);
     const msgs = env.ephemerals('UA');
-    assert.ok(msgs.every((m) => m.startsWith('[테스트]')));
-    assert.ok(msgs[0].includes('11월 6일 (금)'));
-    assert.ok(msgs.some((m) => m.includes('일정 1건') && m.includes('금요일 회의')));
-    assert.ok(msgs.some((m) => m.includes('15분 후 시작') && m.includes('금요일 회의')));
+    assert.ok(msgs.every((m) => m.startsWith('[테스트')));
+    assert.ok(msgs[0].startsWith('[테스트] ') && msgs[0].includes('11월 6일 (금)'));
+    assert.ok(msgs.some((m) => m.startsWith('[테스트 · 하루 요약]') && m.includes('*디자인팀*  일정 1개') && m.includes('금요일 회의')));
+    assert.ok(msgs.some((m) => m.startsWith('[테스트 · 일정별 알림]') && m.includes('*디자인팀*  금요일 회의') && m.includes('14:00 - 15:00')));
     assert.ok(!msgs.join('\n').includes('목요일 회의') && !msgs.join('\n').includes('다음 회의'));
     assert.strictEqual(env.posts('C1').length, 0);
   },
@@ -475,6 +509,25 @@ const tests = {
     assert.ok(response(submit(['UA', 'UG'])).errors.admins.includes('게스트'));
     assert.strictEqual(submit(['UA', 'UB']).content, '');
     assert.deepStrictEqual(env.channel('C1').admins, ['UA', 'UB']);
+  },
+
+  'app home shows a settings button only on channels the viewer administers': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    env.event({ type: 'app_home_opened', user: 'UA', tab: 'home' });
+    env.event({ type: 'app_home_opened', user: 'UB', tab: 'home' });
+    const [adminHome, memberHome] = env.calls('views.publish').map((c) => c.params.view);
+    const settingsButtons = (view) => view.blocks.filter((b) => b.accessory && b.accessory.action_id === 'open_channel').map((b) => b.accessory.value);
+    assert.deepStrictEqual(settingsButtons(adminHome), ['C1']);
+    assert.deepStrictEqual(settingsButtons(memberHome), []);
+    assert.ok(JSON.stringify(memberHome).includes('<#C1>'));
+
+    const open = (user) => env.interact({ type: 'block_actions', user: { id: user }, view: { id: 'VH', type: 'home' }, actions: [{ action_id: 'open_channel', value: 'C1' }] });
+    open('UB');
+    assert.strictEqual(env.calls('views.open').length, 0);
+    open('UA');
+    const modal = env.calls('views.open')[0].params.view;
+    assert.strictEqual(JSON.parse(modal.private_metadata).channelId, 'C1');
+    assert.ok(actionIds(modal).includes('add_conn'));
   },
 
   'only the installer can hand the installer role to someone else': () => {
