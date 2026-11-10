@@ -32,6 +32,7 @@ const MAX_CALENDAR_TRIGGERS = 15; // Apps Script는 스크립트당 트리거 20
 const NOTIFY_COOLDOWN = 6 * 60 * MINUTE;
 const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 수 있습니다.
 
+const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -862,6 +863,8 @@ function handleBlockAction_(payload, userId) {
     }
     return;
   }
+
+  if (action.action_id === 'home_menu') return; // 홈의 [⋯] 메뉴는 링크만 엽니다.
 
   const meta = view ? JSON.parse(view.private_metadata || '{}') : {};
   const chId = meta.channelId;
@@ -2521,16 +2524,27 @@ function installerModal_(userId) {
       input_('installer', '앱 설치자', { type: 'users_select', initial_user: userId }),
       context_('서비스에 문제가 생기면 앱 설치자에게 DM이 발송됩니다.'),
       { type: 'divider' },
-      section_('*문제 발생 시*\n설치자 권한 변경 시, 다음 스크립트를 참조합니다.'),
-      context_('<https://github.com/boeunde/checky-bot|github.com/boeunde/checky-bot>　|　MIT License'),
+      section_('*문제 발생 시*\n설치 방법과 문제 해결은 아래 GitHub 문서를 참고하세요.'),
+      context_(`<${GITHUB_URL}|github.com/boeunde/checky-bot>　|　MIT License`),
     ],
   };
 }
 
 function publishHome_(userId) {
   const meta = loadMeta_();
+  // 맨 위 오른쪽 [⋯] 메뉴: 링크만 엽니다(누른 뒤 서버에서 할 일은 없습니다).
+  // Slack 더보기 메뉴는 항목이 2개 이상이어야 해서 라이선스 링크를 함께 둡니다.
+  const intro = section_('\n　\n공용 Google 캘린더의 일정을 Slack 채널로 발송합니다.\n　\n');
+  intro.accessory = {
+    type: 'overflow',
+    action_id: 'home_menu',
+    options: [
+      { text: plain_('GitHub 열기'), value: 'github', url: GITHUB_URL },
+      { text: plain_('라이선스 (MIT)'), value: 'license', url: `${GITHUB_URL}/blob/main/LICENSE` },
+    ],
+  };
   const blocks = [
-    section_('\n　\n공용 Google 캘린더의 일정을 Slack 채널로 발송합니다.\n　\n'),
+    intro,
     { type: 'divider' },
     section_([
       '\n　\n*사용 방법*',

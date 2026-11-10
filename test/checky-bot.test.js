@@ -1211,6 +1211,12 @@ const tests = {
     assert.deepStrictEqual(settingsButtons(adminHome), ['C1']);
     assert.deepStrictEqual(settingsButtons(memberHome), []);
     assert.ok(JSON.stringify(memberHome).includes('<#C1>'));
+    const menu = memberHome.blocks[0].accessory;
+    assert.strictEqual(menu.type, 'overflow', 'top-right ⋯ menu on the first block');
+    assert.deepStrictEqual(menu.options.map((o) => [o.text.text, o.url]), [['GitHub 열기', 'https://github.com/boeunde/checky-bot'], ['라이선스 (MIT)', 'https://github.com/boeunde/checky-bot/blob/main/LICENSE']]);
+    const calls = env.state.calls.length;
+    env.interact({ type: 'block_actions', user: { id: 'UB' }, view: { id: 'VH', type: 'home' }, actions: [{ action_id: 'home_menu', selected_option: { value: 'github' } }] });
+    assert.strictEqual(env.state.calls.length, calls, 'opening a link does nothing on the server');
 
     const open = (user) => env.interact({ type: 'block_actions', user: { id: user }, view: { id: 'VH', type: 'home' }, actions: [{ action_id: 'open_channel', value: 'C1' }] });
     open('UB');
