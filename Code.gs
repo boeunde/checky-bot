@@ -39,8 +39,7 @@ const DAY_NAMES = ['일', '월', '화', '수', '목', '금', '토'];
 const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
 const WEEKDAYS = [1, 2, 3, 4, 5];
 const REMOVED_ERRORS = ['not_in_channel', 'channel_not_found', 'is_archived'];
-// 아래 둘은 v1 트리거 이름입니다. 같은 프로젝트에서 setup을 실행하면 함께 정리됩니다.
-const TRIGGER_HANDLERS = ['dispatchDue', 'rebuildSchedule', 'onCalendarChanged', 'checkUpcomingEvents', 'sendDailySummary'];
+const TRIGGER_HANDLERS = ['dispatchDue', 'rebuildSchedule', 'onCalendarChanged'];
 
 const HELP_TEXT = [
   '*checky-bot 사용법*',
@@ -80,8 +79,21 @@ function setup() {
   console.log(`Slack 봇 ${auth.user}(으)로 연결되었습니다. 이제 웹 앱으로 배포하세요.`);
 }
 
-/** 10분마다: 앞으로 보낼 알림 목록을 새로 만듭니다. */
+// 자동 실행 함수 셋은 걸린 시간을 날짜별로 기록합니다(하루 90분 한도 확인용, usageReport 참고).
 function rebuildSchedule() {
+  withUsage_('rebuildSchedule', runRebuildSchedule_);
+}
+
+function onCalendarChanged(e) {
+  withUsage_('onCalendarChanged', () => runOnCalendarChanged_(e));
+}
+
+function dispatchDue() {
+  withUsage_('dispatchDue', runDispatchDue_);
+}
+
+/** 10분마다: 앞으로 보낼 알림 목록을 새로 만듭니다. */
+function runRebuildSchedule_() {
   syncCalendarTriggers_();
   const { failures } = rebuildSchedule_();
   // 변경 알림: 트리거가 없는 캘린더(15개 초과)와 놓친 변경을 여기서 확인합니다.
@@ -90,7 +102,7 @@ function rebuildSchedule() {
 }
 
 /** 캘린더가 바뀌면: 다음 1분 실행 때 목록을 다시 만들고, 변경 알림을 켠 캘린더면 바뀐 일정을 확인합니다. */
-function onCalendarChanged(e) {
+function runOnCalendarChanged_(e) {
   invalidateSchedule_();
   if (e && e.calendarId) {
     const failures = syncChanges_(e.calendarId);
@@ -99,7 +111,7 @@ function onCalendarChanged(e) {
 }
 
 /** 1분마다: 목록에서 지금 보낼 알림만 보냅니다. 캘린더를 읽지 않아 가볍습니다. */
-function dispatchDue() {
+function runDispatchDue_() {
   const cache = CacheService.getScriptCache();
   if (cache.get('dispatching')) return; // 이전 실행이 아직 진행 중
   cache.put('dispatching', '1', 50);
@@ -728,7 +740,7 @@ function handleCommand_(p) {
     if (!isBotMember_(p.channel_id)) {
       return ephemeralJson_('먼저 이 채널에 checky-bot을 초대하세요: `/invite @checky-bot`');
     }
-    // 초대 기록이 없는 채널(예: 예전에 초대된 채널)은 처음 /checky를 실행한 사람이 관리자가 됩니다.
+    // 초대 기록이 없는 채널(예: 설치를 마치기 전에 초대된 채널)은 처음 /checky를 실행한 사람이 관리자가 됩니다.
     if (!ineligibleReason_(p.user_id)) {
       updateChannel_(p.channel_id, (c) => {
         if (c.admins.length) return;
@@ -1085,7 +1097,7 @@ function draftProblems_(draft) {
   return problems;
 }
 
-/** 켜짐/꺼짐 버튼이나 탭을 누르면 화면을 다시 그립니다. 저장은 [저장]을 눌러야 됩니다. */
+/** 켜짐/꺼짐 버튼이나 알림 유형을 고르면 화면을 다시 그립니다. 저장은 [저장]을 눌러야 됩니다. */
 function editDraft_(payload, ch, chId, action) {
   const view = payload.view;
   const meta = JSON.parse(view.private_metadata || '{}');
@@ -1337,21 +1349,10 @@ function defaultChanges_() {
 
 const CHANGE_SET_KEYS = ['types', 'wait', 'past', 'days', 'hold', 'holdTime'];
 
-/**
- * 세트 목록 형태로 맞춥니다. 세트가 생기기 전 연결은 그때의 설정 그대로 세트 1이 되고,
- * 요일이 생기기 전 연결은 매일 보내던 대로 둡니다.
- */
+/** 빠진 값을 기본값으로 채웁니다. */
 function normalizeChanges_(saved) {
   if (!saved) return defaultChanges_();
-  let sets = saved.sets;
-  if (!Array.isArray(sets) || !sets.length) {
-    const legacy = {};
-    CHANGE_SET_KEYS.forEach((k) => {
-      if (k in saved) legacy[k] = saved[k];
-    });
-    if (!saved.days) legacy.days = [0, 1, 2, 3, 4, 5, 6];
-    sets = [legacy];
-  }
+  const sets = Array.isArray(saved.sets) && saved.sets.length ? saved.sets : [{}];
   return {
     enabled: !!saved.enabled,
     since: saved.since || 0,
@@ -1812,6 +1813,63 @@ function notifyInstallerOnce_(key, text) {
   notifyInstaller_(text);
 }
 
+// ─── 실행 시간 기록 ───────────────────────────────────────
+// 개인 Gmail 계정은 자동 실행 시간이 하루 90분으로 제한됩니다. 넘으면 그날은 알림이 멈춥니다.
+// 자동 실행마다 걸린 시간을 USAGE에 날짜별로 더하고, USAGE_WARN_MINUTES를 넘으면 앱 설치자에게 하루 한 번 DM을 보냅니다.
+// 실행 준비 시간 등은 빠지므로 구글이 세는 시간보다 조금 적게 나옵니다. 겹쳐 실행되면 일부가 빠질 수도 있습니다.
+
+const USAGE_KEEP_DAYS = 14;
+const USAGE_WARN_MINUTES = 60;
+const USAGE_LIMIT_MINUTES = 90;
+
+function withUsage_(name, run) {
+  const start = Date.now();
+  try {
+    run();
+  } finally {
+    try {
+      recordUsage_(name, Date.now() - start, start);
+    } catch (err) {
+      console.warn(`실행 시간을 기록하지 못했습니다: ${err.message}`);
+    }
+  }
+}
+
+function recordUsage_(name, ms, at) {
+  const usage = loadJson_('USAGE', {});
+  const day = dayKey_(at);
+  const today = (usage[day] = usage[day] || {});
+  today[name] = (today[name] || 0) + ms;
+  Object.keys(usage).sort().slice(0, -USAGE_KEEP_DAYS).forEach((d) => delete usage[d]);
+  const total = usageTotal_(today);
+  const warn = !today.warned && total >= USAGE_WARN_MINUTES * MINUTE;
+  if (warn) today.warned = true;
+  saveJson_('USAGE', usage);
+  if (warn) {
+    notifyInstaller_(`:warning: checky-bot의 오늘 자동 실행 시간이 ${Math.round(total / MINUTE)}분입니다. 하루 ${USAGE_LIMIT_MINUTES}분을 넘으면 그날 남은 시간 동안 알림이 멈춥니다. 연결한 캘린더 수를 줄이거나 Apps Script 실행 기록을 확인하세요.`);
+  }
+}
+
+function usageTotal_(day) {
+  return TRIGGER_HANDLERS.reduce((sum, name) => sum + (day[name] || 0), 0);
+}
+
+/** 편집기에서 실행: 최근 7일의 하루 자동 실행 시간을 로그에 보여 줍니다. */
+function usageReport() {
+  const usage = loadJson_('USAGE', {});
+  const days = Object.keys(usage).sort().slice(-7);
+  const minutes = (ms) => `${Math.round((ms / MINUTE) * 10) / 10}분`;
+  const lines = days.map((d) => {
+    const parts = TRIGGER_HANDLERS.filter((n) => usage[d][n]).map((n) => `${n} ${minutes(usage[d][n])}`);
+    return `${d}  ${minutes(usageTotal_(usage[d]))}  (${parts.join(', ')})`;
+  });
+  const text = lines.length
+    ? `하루 자동 실행 시간 (한도 ${USAGE_LIMIT_MINUTES}분)\n${lines.join('\n')}`
+    : '아직 기록이 없습니다. 자동 실행이 돌기 시작하면 쌓입니다.';
+  console.log(text);
+  return text;
+}
+
 // ─── 저장소 ───────────────────────────────────────────────
 
 function loadJson_(key, fallback) {
@@ -1829,8 +1887,6 @@ function loadMeta_() {
 
 function loadChannel_(chId) {
   const ch = chId ? loadJson_(`CH_${chId}`, null) : null;
-  // "종일 일정 알림" 켜짐/꺼짐이 생기기 전의 연결은 종일 일정도 알렸으므로 켜짐으로 읽습니다.
-  if (ch) ch.connections.forEach((conn) => { if (conn.reminder && conn.reminder.allDay === undefined) conn.reminder.allDay = true; });
   return ch;
 }
 
@@ -2263,7 +2319,7 @@ function changeCalendarModal_(chId, conn, parentViewId) {
 /**
  * 알림 설정 화면. draft는 저장 전 고른 값이며, 없으면 저장된 설정으로 그립니다.
  * Slack에는 토글 스위치가 없어 켜기/끄기는 버튼으로 만들고, 누를 때마다 화면을 다시 그립니다(editDraft_).
- * 꺼진 루틴은 세부 항목을 숨깁니다. 하루 요약과 일정 알림은 탭 버튼으로 나눠 한쪽만 보여 줍니다.
+ * 꺼진 루틴은 세부 항목을 숨깁니다. 알림 유형 드롭다운에서 고른 유형만 보여 줍니다.
  */
 function connModal_(chId, conn, parentViewId, draft) {
   draft = draft || JSON.parse(JSON.stringify({ daily: conn.daily, reminder: conn.reminder, changes: changesOf_(conn) }));
@@ -2298,12 +2354,12 @@ function connModal_(chId, conn, parentViewId, draft) {
       accessory: { type: 'static_select', action_id: 'pick_tab', options: kinds, initial_option: findOption_(kinds, tab) },
     }),
   ];
-  // 경고는 숨긴 탭의 문제도 보이도록 탭 바로 아래에 둡니다.
+  // 경고는 지금 보이지 않는 유형의 문제도 보이도록 알림 유형 바로 아래에 둡니다.
   if (problems.none) blocks.push(context_(':warning: 하루 요약, 일정 알림, 변경 알림 중 하나 이상 켜야 저장됩니다.'));
   if (problems.daily) blocks.push(context_(':warning: 하루 요약의 요일을 하나 이상 고르세요.'));
   if (problems.reminder) blocks.push(context_(':warning: 일정 알림의 요일을 하나 이상 고르세요.'));
   const setNames = (nums) => nums.map((n) => `세트 ${n}`).join(', ');
-  // 변경 알림 경고는 변경 알림 탭에서는 [켜짐] 버튼 바로 아래에, 다른 탭을 보고 있을 때는 여기에 둡니다.
+  // 변경 알림 경고는 변경 알림을 보고 있을 때는 [켜짐] 버튼 바로 아래에, 다른 유형을 보고 있을 때는 여기에 둡니다.
   const onChanges = tab === 'changes';
   const where = onChanges ? '' : '변경 알림 ';
   const changeWarnings = [];

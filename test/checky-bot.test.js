@@ -951,6 +951,27 @@ const tests = {
     assert.ok(dms[0].includes('Google Calendar API'));
   },
 
+  'trigger runtime is recorded per day; the installer is warned once past 60 minutes': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    env.clearCalls();
+    env.run('dispatchDue');
+    env.run('rebuildSchedule');
+    const usage = () => JSON.parse(env.state.props.USAGE);
+    assert.deepStrictEqual(Object.keys(usage()['2026-11-09']).sort(), ['dispatchDue', 'rebuildSchedule'], 'each trigger run is recorded');
+
+    const MIN = 60 * 1000;
+    const at = env.sandbox.Date.now();
+    env.sandbox.recordUsage_('dispatchDue', 59 * MIN, at);
+    assert.strictEqual(env.posts('UA').length, 0, 'under 60 minutes: no DM');
+    env.sandbox.recordUsage_('dispatchDue', 2 * MIN, at);
+    env.sandbox.recordUsage_('rebuildSchedule', 5 * MIN, at);
+    assert.strictEqual(env.posts('UA').length, 1, 'one DM per day');
+    assert.ok(env.posts('UA')[0].includes('오늘 자동 실행 시간이 61분'), env.posts('UA')[0]);
+
+    const report = env.sandbox.usageReport();
+    assert.ok(report.includes('2026-11-09  66분  (dispatchDue 61분, rebuildSchedule 5분)'), report);
+  },
+
   'the ⋯ menu disconnects after confirming; paused status and the change log show in the channel settings': () => {
     const env = connectedEnv('2026-11-09T10:00');
     const connId = env.channel('C1').connections[0].id;
@@ -1003,9 +1024,9 @@ const tests = {
     addConnection(fresh, 'cal1');
     assert.strictEqual(fresh.channel('C1').connections[0].reminder.allDay, false, 'off by default for new connections');
 
-    // A connection saved before the switch existed keeps getting all-day reminders.
+    // With the switch on, all-day events get a reminder.
     const ch = JSON.parse(fresh.state.props.CH_C1);
-    delete ch.connections[0].reminder.allDay;
+    ch.connections[0].reminder.allDay = true;
     ch.connections[0].reminder.enabled = true;
     fresh.state.props.CH_C1 = JSON.stringify(ch);
     fresh.state.calendars.cal1.events.push(event);
@@ -1055,7 +1076,7 @@ const tests = {
     assert.ok(response(env.command({ user_id: 'UA', channel_id: 'C9', text: 'today' })).text.includes('연결된 캘린더가 없습니다'));
   },
 
-  'change alerts on unchosen weekdays are dropped, or held for the next chosen day when 쌓인 알림 is on': () => {
+  'change alerts on unchosen weekdays are dropped, or held for the next chosen day when 미설정요일 알림 모아보내기 is on': () => {
     // 2026-11-07 is a Saturday; weekdays only.
     const setup = (hold) => {
       const env = connectedEnv('2026-11-07T10:00', []);
@@ -1141,10 +1162,6 @@ const tests = {
     const view = JSON.stringify(env.calls('views.open').at(-1).params.view);
     assert.ok(view.includes('✏️ 변경 알림 (월-금)  |  등록, 변경만  |  즉시 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 X'), view);
     assert.ok(view.includes('✏️ 변경 알림 (금)  |  삭제만  |  즉시 알림'), 'one summary line per set');
-
-    // Settings saved before sets existed become set 1.
-    const legacy = env.sandbox.normalizeChanges_({ enabled: true, types: ['created'], wait: 3, past: true, since: 5, hold: true, holdTime: 600 });
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(legacy)), { enabled: true, since: 5, sets: [{ id: 1, types: ['created'], wait: 3, past: true, days: [0, 1, 2, 3, 4, 5, 6], hold: true, holdTime: 600 }] });
   },
 
   'repeat rules read like Google Calendar, in the small gray line under the event': () => {
