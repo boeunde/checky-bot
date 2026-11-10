@@ -32,6 +32,7 @@ const MAX_CALENDAR_TRIGGERS = 15; // Apps Script는 스크립트당 트리거 20
 const NOTIFY_COOLDOWN = 6 * 60 * MINUTE;
 const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 수 있습니다.
 
+const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
 const DAY_NAMES = ['일', '월', '화', '수', '목', '금', '토'];
@@ -45,6 +46,8 @@ const HELP_TEXT = [
   '*checky-bot 사용법*',
   '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`',
   '2. 그 채널에서 `/checky`를 입력해 캘린더를 연결하고 알림을 설정합니다.',
+  '• `/checky today`: 이 채널 캘린더의 오늘 일정을 나에게만 보여 줍니다.',
+  '• `/checky today-all`: 오늘 일정을 채널에 보냅니다 (채널 관리자만).',
   '• 봇 메시지 지우기: 메시지의 ⋯ 메뉴 > checky-bot 메시지 삭제 (채널 관리자만)',
 ].join('\n');
 
@@ -216,7 +219,7 @@ function rebuildSchedule_() {
 }
 
 /**
- * 일정별 알림. 요일은 일정이 있는 날 기준입니다.
+ * 일정 알림. 요일은 일정이 있는 날 기준입니다. 종일 일정은 "종일 일정 알림"을 켰을 때만 알립니다.
  * onlyDay를 주면 그날 일정만, 요일 설정과 관계없이 만듭니다(테스트용).
  */
 function reminderItems_(conn, infos, from, to, onlyDay, color) {
@@ -224,6 +227,7 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
   const items = [];
   infos.forEach((info) => {
     if (info.allDay) {
+      if (!r.allDay) return;
       for (let i = 0; i < info.days; i++) {
         const day = info.start + i * DAY;
         if (onlyDay !== undefined ? day !== onlyDay : !r.days.includes(kstParts_(day).dow)) continue;
@@ -257,7 +261,7 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
 }
 
 /**
- * 같은 채널·같은 연결·같은 시각의 일정별 알림을 한 메시지로 묶습니다.
+ * 같은 채널·같은 연결·같은 시각의 일정 알림을 한 메시지로 묶습니다.
  * 머리글은 첫 일정에만 남깁니다. 보낸 기록은 일정마다 남기므로(keys),
  * 나중에 같은 시각에 일정이 추가돼도 이미 보낸 일정은 다시 보내지 않습니다.
  */
@@ -352,7 +356,90 @@ function eventInfo_(event, calendarId) {
     && visibility !== CalendarApp.Visibility.PRIVATE
     && visibility !== CalendarApp.Visibility.CONFIDENTIAL;
   info.link = eventLink_(event, calendarId, info);
+  // 반복 일정은 "매주 화요일, 13회"처럼 반복 규칙을 작은 회색 글씨로 함께 보여 줍니다.
+  if (info.notifiable && isRecurring_(event)) info.recurrence = recurrenceText_(calendarId, String(event.getId()).split('@')[0], info.start);
   return info;
+}
+
+function isRecurring_(event) {
+  try {
+    return event.isRecurringEvent();
+  } catch (err) {
+    return false;
+  }
+}
+
+// ─── 반복 규칙 문장 ───────────────────────────────────────
+//
+// CalendarApp은 반복 규칙을 주지 않아 Google Calendar API(고급 서비스)로 원래 일정의 RRULE을 읽습니다.
+// 같은 반복 일정은 6시간 동안 저장해 두고 다시 읽지 않습니다. API가 없거나 읽지 못하면 표시하지 않습니다.
+
+const RECURRENCE_CACHE_SECONDS = 6 * 60 * 60;
+const RRULE_DAYS = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+const ORDINALS = { 1: '첫째', 2: '둘째', 3: '셋째', 4: '넷째', 5: '다섯째', '-1': '마지막' };
+
+/** seriesId: 반복 일정 원본의 ID. recurrence를 주면 API를 부르지 않습니다. */
+function recurrenceText_(calendarId, seriesId, startMs, recurrence) {
+  if (recurrence) return describeRecurrence_(recurrence, startMs);
+  if (typeof Calendar === 'undefined' || !seriesId) return null;
+  const cache = CacheService.getScriptCache();
+  const key = `rr|${hash_(`${calendarId}|${seriesId}`)}`;
+  let rules = cache.get(key);
+  if (rules === null) {
+    try {
+      rules = (Calendar.Events.get(calendarId, seriesId).recurrence || []).join('\n');
+    } catch (err) {
+      rules = '';
+    }
+    cache.put(key, rules || '-', RECURRENCE_CACHE_SECONDS);
+  }
+  if (!rules || rules === '-') return null;
+  return describeRecurrence_(rules.split('\n'), startMs);
+}
+
+/** ["RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=13"] → "매주 화요일, 13회". 문장으로 만들 수 없는 규칙은 "반복 일정"입니다. */
+function describeRecurrence_(lines, startMs) {
+  const line = lines.find((l) => /^RRULE:/.test(l));
+  if (!line) return null;
+  const r = {};
+  line.slice(6).split(';').forEach((part) => {
+    const [k, v] = part.split('=');
+    r[k] = v;
+  });
+  const n = Number(r.INTERVAL || 1);
+  const start = kstParts_(startMs);
+  const dayName = (code) => `${DAY_NAMES[RRULE_DAYS[code]]}요일`;
+  let text = null;
+  if (!r.BYSETPOS && !r.BYWEEKNO && !r.BYYEARDAY && !r.BYHOUR) {
+    if (r.FREQ === 'DAILY' && !r.BYDAY) {
+      text = n === 1 ? '매일' : `${n}일마다`;
+    } else if (r.FREQ === 'WEEKLY' || (r.FREQ === 'DAILY' && r.BYDAY)) {
+      const codes = r.BYDAY ? r.BYDAY.split(',') : [Object.keys(RRULE_DAYS).find((c) => RRULE_DAYS[c] === start.dow)];
+      if (codes.every((c) => c in RRULE_DAYS)) {
+        const sorted = WEEK_ORDER.filter((d) => codes.some((c) => RRULE_DAYS[c] === d));
+        const days = sorted.join() === WEEKDAYS.join() ? '월-금' : sorted.map((d) => `${DAY_NAMES[d]}요일`).join(', ');
+        text = `${n === 1 ? '매주' : `${n}주마다`} ${days}`;
+      }
+    } else if (r.FREQ === 'MONTHLY') {
+      const base = n === 1 ? '매월' : `${n}개월마다`;
+      const nth = r.BYDAY && /^(-?\d)([A-Z]{2})$/.exec(r.BYDAY);
+      if (nth && ORDINALS[nth[1]] && nth[2] in RRULE_DAYS) text = `${base} ${ORDINALS[nth[1]]} ${dayName(nth[2])}`;
+      else if (!r.BYDAY && (!r.BYMONTHDAY || /^\d+$/.test(r.BYMONTHDAY))) text = `${base} ${r.BYMONTHDAY || start.d}일`;
+    } else if (r.FREQ === 'YEARLY' && !r.BYDAY) {
+      text = `${n === 1 ? '매년' : `${n}년마다`} ${r.BYMONTH || start.m}월 ${r.BYMONTHDAY || start.d}일`;
+    }
+  }
+  if (!text) return '반복 일정';
+  if (r.COUNT) text += `, ${r.COUNT}회`;
+  else if (r.UNTIL) {
+    const u = /^(\d{4})(\d{2})(\d{2})(T(\d{2})(\d{2})(\d{2})Z?)?$/.exec(r.UNTIL);
+    if (u) {
+      const ms = u[4] ? Date.UTC(+u[1], +u[2] - 1, +u[3], +u[5], +u[6], +u[7]) : Date.UTC(+u[1], +u[2] - 1, +u[3]) - KST_OFFSET;
+      const p = kstParts_(ms);
+      text += `, ${p.y}년 ${p.m}월 ${p.d}일까지`;
+    }
+  }
+  return text;
 }
 
 /**
@@ -396,19 +483,19 @@ function cleanDescription_(html) {
 /*
  * 메시지 모양: 캘린더 이름 줄(머리글)은 색 막대 없이, 일정마다 캘린더 색 막대를 붙입니다.
  *
- *   📅 오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건     ← 하루 요약 머리글 (막대 없음)
- *   🔔 일정 알림 | 디자인팀 | 총 1건                       ← 일정별 알림 머리글
+ *   오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건     ← 하루 요약 머리글 (막대 없음)
+ *   일정 알림 | 디자인팀 | 총 1건                       ← 일정 알림 머리글
  *   ┃ 종일 창립기념일                                    ← 일정 (막대, 제목은 일정 링크)
  *   ┃ 12:00 - 15:00 주간 회의
  *
  * Slack 첨부의 pretext(막대 위 바깥 글자)에 머리글을 넣어 이 모양을 만듭니다.
  * 알림이 늦게 도착할 수 있어 "N분 후" 같은 표현은 쓰지 않습니다.
- * "총 n건"은 하루 요약은 여기서, 일정별 알림은 한 메시지로 묶을 때(mergeItems_) 붙입니다.
+ * "총 n건"은 하루 요약은 여기서, 일정 알림은 한 메시지로 묶을 때(mergeItems_) 붙입니다.
  */
 
-/** 일정별 알림 하나. "🔔 일정 알림 | 캘린더 이름" */
+/** 일정 알림 하나. "🔔 일정 알림 | 캘린더 이름" */
 function reminderAttachment_(conn, color, info, day) {
-  return eventAttachment_(conn, color, info, day, `:bell: *일정 알림* | ${escapeSlack_(conn.calendarName)}`);
+  return eventAttachment_(conn, color, info, day, `*일정 알림* | ${escapeSlack_(conn.calendarName)}`);
 }
 
 /**
@@ -425,7 +512,7 @@ function dailyAttachments_(day, entries, sendAt) {
       .filter((i) => (i.allDay ? i.start <= day && i.end > day : i.start >= day && i.start < day + DAY))
       .sort((a, b) => (a.allDay === b.allDay ? a.start - b.start : a.allDay ? -1 : 1));
     if (!items.length && conn.daily.empty !== 'send') return;
-    const header = `:date: ${dayHeader_(conn, day, `${relativeDay_(day, sendAt) || '하루'} 요약`)} | 총 ${items.length}건`;
+    const header = `${dayHeader_(conn, day, `${relativeDay_(day, sendAt) || '하루'} 요약`)} | 총 ${items.length}건`;
     if (!items.length) {
       attachments.push(withColor_({ pretext: header, text: '일정 없음', fallback: `${conn.calendarName} 일정 없음`, mrkdwn_in: ['pretext', 'text'] }, color));
       return;
@@ -485,10 +572,9 @@ function calendarColor_(calendar) {
  * 인용(>)을 쓰면 색 막대 안에 세로줄이 하나 더 생겨서 쓰지 않습니다. footer는 300자까지입니다.
  */
 function withDescription_(attachment, info) {
-  if (info.description) {
-    const text = escapeSlack_(info.description);
-    attachment.footer = text.length > 300 ? `${text.slice(0, 299)}…` : text;
-  }
+  // 반복 규칙("매주 화요일, 13회")이 있으면 첫 줄에, 설명은 그 아래에 둡니다.
+  const text = [info.recurrence, info.description].filter(Boolean).map(escapeSlack_).join('\n');
+  if (text) attachment.footer = text.length > 300 ? `${text.slice(0, 299)}…` : text;
   return attachment;
 }
 
@@ -544,9 +630,10 @@ function dayKey_(ms) {
   return `${p.y}-${pad2_(p.m)}-${pad2_(p.d)}`;
 }
 
+/** "2026/11/09 오후 8:12" */
 function formatLogTime_(ms) {
   const p = kstParts_(ms);
-  return `${p.m}/${p.d} ${formatHm_(p.minutes)}`;
+  return `${p.y}/${pad2_(p.m)}/${pad2_(p.d)} ${formatAmPm_(p.minutes)}`;
 }
 
 // ─── Slack 요청 받기 ──────────────────────────────────────
@@ -634,6 +721,8 @@ function handleCommand_(p) {
     return ephemeralJson_('알림을 받을 채널에서 `/checky`를 입력하세요.');
   }
 
+  if (text === 'today' || text === 'today-all') return sendToday_(p, text === 'today-all');
+
   const ch = loadChannel_(p.channel_id);
   if (!ch || !ch.admins.length) {
     if (!isBotMember_(p.channel_id)) {
@@ -649,6 +738,77 @@ function handleCommand_(p) {
     }
   }
   slackApi_('views.open', { trigger_id: p.trigger_id, view: channelModal_(p.channel_id, p.user_id) });
+  return null;
+}
+
+/**
+ * /checky today: 이 채널에 연결된 캘린더의 오늘 일정을 나에게만 보이게 보냅니다(채널 멤버 누구나).
+ * /checky today-all: 같은 내용을 채널에 보냅니다(채널봇 관리자만).
+ * 하루 요약 설정(범위, 요일, 켜짐/꺼짐)과 관계없이 오늘의 모든 일정을 보여 주고, 일정이 없으면 "일정 없음"을 보여 줍니다.
+ * 캘린더를 읽느라 Slack의 3초 제한을 넘길 수 있어, 응답 대신 메시지 API로 보냅니다.
+ * today-all은 채널 전체에 가므로 확인 창을 먼저 띄우고, [발송]을 누르면 보냅니다(submitTodayAll_).
+ */
+function sendToday_(p, toChannel) {
+  const ch = loadChannel_(p.channel_id);
+  const connections = ch ? ch.connections.filter((c) => !c.paused) : [];
+  if (!connections.length) return ephemeralJson_('이 채널에 연결된 캘린더가 없습니다. `/checky`에서 캘린더를 추가하세요.');
+  if (toChannel && !isAdmin_(ch, p.user_id)) {
+    return ephemeralJson_('채널에 보내기는 이 채널의 관리자만 할 수 있습니다. 나만 보려면 `/checky today`를 입력하세요.');
+  }
+  if (toChannel) {
+    slackApi_('views.open', { trigger_id: p.trigger_id, view: todayAllModal_(p.channel_id) });
+    return null;
+  }
+  const error = postToday_(p.channel_id, p.user_id, false);
+  return error ? ephemeralJson_(error) : null;
+}
+
+function todayAllModal_(chId) {
+  return {
+    type: 'modal',
+    callback_id: 'today_all',
+    title: plain_('오늘 일정 발송'),
+    submit: plain_('발송'),
+    close: plain_('취소'),
+    private_metadata: JSON.stringify({ channelId: chId }),
+    blocks: [section_(`<#${chId}>에 오늘의 전체 일정을 발송하시겠습니까?`)],
+  };
+}
+
+/** 확인 창의 [발송]. 문제가 있으면 확인 창을 안내로 바꿉니다. */
+function submitTodayAll_(meta, userId) {
+  const ch = loadChannel_(meta.channelId);
+  if (!isAdmin_(ch, userId)) return json_({ response_action: 'update', view: noticeModal_('오늘 일정 발송', '이 채널의 관리자만 보낼 수 있습니다.') });
+  const error = postToday_(meta.channelId, userId, true);
+  return error ? json_({ response_action: 'update', view: noticeModal_('오늘 일정 발송', error) }) : null;
+}
+
+/** 오늘 일정을 채널(toChannel) 또는 나에게만 보냅니다. 실패하면 안내 문구, 성공하면 null. */
+function postToday_(chId, userId, toChannel) {
+  const ch = loadChannel_(chId);
+  const connections = ch ? ch.connections.filter((c) => !c.paused) : [];
+  if (!connections.length) return '이 채널에 연결된 캘린더가 없습니다. `/checky`에서 캘린더를 추가하세요.';
+  const now = Date.now();
+  const day = kstDayStart_(now);
+  const entries = [];
+  connections.forEach((conn) => {
+    const calendar = openCalendar_(conn.calendarId);
+    if (!calendar) return;
+    entries.push({
+      conn: Object.assign({}, conn, { daily: Object.assign({}, conn.daily, { scope: 'all', empty: 'send' }) }),
+      infos: readEvents_(calendar, day, day + DAY),
+      color: calendarColor_(calendar),
+    });
+  });
+  if (!entries.length) return '연결된 캘린더를 읽지 못했습니다. 공용 구글 계정에 캘린더가 공유돼 있는지 확인하세요.';
+  const attachments = dailyAttachments_(day, entries, now);
+  try {
+    if (toChannel) postMessage_(chId, '', attachments);
+    else postEphemeral_(chId, userId, '', attachments);
+  } catch (err) {
+    return `보내지 못했습니다: ${err.message}`;
+  }
+  if (toChannel) updateChannel_(chId, (c) => addLog_(c, userId, '오늘 일정 채널에 발송'));
   return null;
 }
 
@@ -696,8 +856,17 @@ function handleBlockAction_(payload, userId) {
   if (!chId) return;
   const ch = loadChannel_(chId);
   if (!isAdmin_(ch, userId)) return; // 관리자가 아니면 무시합니다.
-  if (action.action_id === 'toggle_routine' || action.action_id === 'tab_daily' || action.action_id === 'tab_reminder' || action.action_id === 'tab_changes') {
+  if (action.action_id === 'toggle_routine' || action.action_id === 'pick_tab') {
     editDraft_(payload, ch, chId, action);
+    return;
+  }
+  if (action.action_id === 'conn_menu') {
+    // [⋯] 메뉴: "⚙️ 설정"은 알림 설정 창을, "연결 끊기"는 확인 창을 엽니다.
+    // "구글 캘린더 열기"는 Slack이 링크를 바로 열어 할 일이 없습니다.
+    const [what, connId] = String((action.selected_option && action.selected_option.value) || '').split('|');
+    const target = ch.connections.find((c) => c.id === connId);
+    if (what === 'settings' && target) slackApi_('views.push', { trigger_id: payload.trigger_id, view: connModal_(chId, target, view.id) });
+    if (what === 'delete' && target) slackApi_('views.push', { trigger_id: payload.trigger_id, view: disconnectModal_(chId, target, view.id) });
     return;
   }
   const conn = ch.connections.find((c) => c.id === action.value);
@@ -733,13 +902,13 @@ function handleBlockAction_(payload, userId) {
       if (!conn) return;
       updateChannel_(chId, (c) => {
         c.connections = c.connections.filter((x) => x.id !== conn.id);
-        addLog_(c, userId, `연결 삭제: ${escapeSlack_(conn.calendarName)}`);
+        addLog_(c, userId, `연결 끊기: ${escapeSlack_(conn.calendarName)}`);
       });
       invalidateSchedule_();
       // 삭제 버튼은 ⚙️ 설정 화면(위에 쌓인 창)에 있습니다. 아래 채널 화면을 새로 고치고, 설정 화면은 안내로 바꿉니다.
       if (meta.parentViewId) {
         updateView_(meta.parentViewId, channelModal_(chId, userId));
-        updateView_(view.id, noticeModal_('알림 설정', `*${escapeSlack_(conn.calendarName)}* 연결을 삭제했습니다.`));
+        updateView_(view.id, noticeModal_('알림 설정', `*${escapeSlack_(conn.calendarName)}* 연결을 끊었습니다.`));
       } else {
         updateView_(view.id, channelModal_(chId, userId));
       }
@@ -759,6 +928,8 @@ function handleSubmission_(payload, userId) {
     if (view.callback_id === 'installer') return submitInstaller_(values, userId);
     if (view.callback_id === 'delete_message') return submitDeleteMessage_(meta, userId);
     const ch = loadChannel_(meta.channelId);
+    if (view.callback_id === 'disconnect') return submitDisconnect_(meta, ch, userId);
+    if (view.callback_id === 'today_all') return submitTodayAll_(meta, userId);
     const firstBlock = { add_conn: 'calendar_id', change_calendar: 'calendar_id', conn_settings: 'notice', admins: 'admins' }[view.callback_id];
     if (!firstBlock) return null;
     if (!isAdmin_(ch, userId)) {
@@ -793,12 +964,27 @@ function submitAddConn_(meta, ch, values, userId) {
   const conn = newConnection_(calendarId, calendar.getName(), userId);
   updateChannel_(meta.channelId, (c) => {
     c.connections.push(conn);
-    addLog_(c, userId, `캘린더 연결: ${escapeSlack_(conn.calendarName)}`);
+    addLog_(c, userId, `새 캘린더 추가: ${escapeSlack_(conn.calendarName)}`);
   });
   invalidateSchedule_();
   sendConnectionPreview_(meta.channelId, conn, calendar, userId);
   // 연결 직후 바로 알림 설정 화면을 보여 줍니다. 저장하면 채널 설정 화면도 새로 고칩니다.
   return json_({ response_action: 'update', view: connModal_(meta.channelId, conn, meta.parentViewId) });
+}
+
+/** 연결 끊기 확인 창의 [연결 끊기]. 아래 채널 설정 화면을 새로 고치고 확인 창을 닫습니다. */
+function submitDisconnect_(meta, ch, userId) {
+  if (!isAdmin_(ch, userId)) return json_({ response_action: 'update', view: noticeModal_('연결 끊기', '이 채널의 관리자만 연결을 끊을 수 있습니다.') });
+  const conn = ch.connections.find((c) => c.id === meta.connId);
+  if (conn) {
+    updateChannel_(meta.channelId, (c) => {
+      c.connections = c.connections.filter((x) => x.id !== conn.id);
+      addLog_(c, userId, `연결 끊기: ${escapeSlack_(conn.calendarName)}`);
+    });
+    invalidateSchedule_();
+  }
+  refreshParent_(meta.parentViewId, meta.channelId, userId);
+  return null;
 }
 
 /**
@@ -860,7 +1046,8 @@ function draftFromView_(meta, values, conn) {
   const offset = pick('reminder_offset');
   if (offset !== null) draft.reminder.offset = Number(offset);
   draft.reminder.allDayTime = pickedTime_(values || {}, 'reminder_allday_time', draft.reminder.allDayTime);
-  ['daily', 'reminder'].forEach((name) => {
+  draft.changes.holdTime = pickedTime_(values || {}, 'changes_hold_time', draft.changes.holdTime);
+  ['daily', 'reminder', 'changes'].forEach((name) => {
     const b = values && values[`${name}_days`];
     if (b && b.v) draft[name].days = WEEK_ORDER.filter((d) => (b.v.selected_options || []).some((o) => Number(o.value) === d));
   });
@@ -879,6 +1066,7 @@ function draftProblems_(draft) {
   if (draft.daily.enabled && !draft.daily.days.length) problems.daily = true;
   if (draft.reminder.enabled && !draft.reminder.days.length) problems.reminder = true;
   if (draft.changes.enabled && !draft.changes.types.length) problems.changes = true;
+  if (draft.changes.enabled && !draft.changes.days.length) problems.changesDays = true;
   return problems;
 }
 
@@ -889,9 +1077,17 @@ function editDraft_(payload, ch, chId, action) {
   const conn = ch.connections.find((c) => c.id === meta.connId);
   if (!conn) return;
   const draft = draftFromView_(meta, view.state && view.state.values, conn);
-  if (!draft[action.value]) return;
-  if (action.action_id === 'toggle_routine') draft[action.value].enabled = !draft[action.value].enabled;
-  else draft.tab = action.value;
+  // 켜짐/꺼짐 버튼은 value에, 알림 유형 드롭다운은 고른 항목(selected_option)에 루틴 이름이 있습니다.
+  const name = action.action_id === 'pick_tab' ? action.selected_option && action.selected_option.value : action.value;
+  if (action.action_id === 'toggle_routine' && name === 'allday') {
+    draft.reminder.allDay = !draft.reminder.allDay; // 일정 알림 안의 "종일 일정 알림"
+  } else if (action.action_id === 'toggle_routine' && name === 'hold') {
+    draft.changes.hold = !draft.changes.hold; // 변경 알림 안의 "고르지 않은 요일의 알림"
+  } else {
+    if (!draft[name]) return;
+    if (action.action_id === 'toggle_routine') draft[name].enabled = !draft[name].enabled;
+    else draft.tab = name;
+  }
   updateView_(view.id, connModal_(chId, conn, meta.parentViewId, draft));
 }
 
@@ -914,7 +1110,7 @@ function submitConnSettings_(meta, ch, values, userId) {
     target.reminder = reminder;
     // 변경 알림을 새로 켜면 그 시점의 일정을 기준으로 삼아, 그 뒤의 변경부터 알립니다.
     const wasOn = changesOf_(target).enabled;
-    target.changes = { enabled: changes.enabled, types: changes.types, wait: changes.wait, past: changes.past, since: changes.enabled && !wasOn ? Date.now() : changesOf_(target).since };
+    target.changes = { enabled: changes.enabled, types: changes.types, wait: changes.wait, past: changes.past, days: changes.days, hold: changes.hold, holdTime: changes.holdTime, since: changes.enabled && !wasOn ? Date.now() : changesOf_(target).since };
     target.updatedAt = Date.now();
     addLog_(c, userId, `알림 설정 변경: ${escapeSlack_(target.calendarName)}`);
     return true;
@@ -942,10 +1138,10 @@ function submitAdmins_(meta, ch, values, userId) {
 
 function submitInstaller_(values, userId) {
   const next = values.installer.v.selected_user;
-  if (loadMeta_().installer !== userId) return errorsJson_({ installer: '현재 앱 관리자만 바꿀 수 있습니다.' });
-  if (!next) return errorsJson_({ installer: '새 앱 관리자를 고르세요.' });
+  if (loadMeta_().installer !== userId) return errorsJson_({ installer: '현재 앱 설치자만 바꿀 수 있습니다.' });
+  if (!next) return errorsJson_({ installer: '새 앱 설치자를 고르세요.' });
   const reason = ineligibleReason_(next);
-  if (reason) return errorsJson_({ installer: `${reason}은(는) 앱 관리자가 될 수 없습니다.` });
+  if (reason) return errorsJson_({ installer: `${reason}은(는) 앱 설치자가 될 수 없습니다.` });
   withLock_(() => {
     const meta = loadMeta_();
     meta.installer = next;
@@ -1003,7 +1199,7 @@ function newConnection_(calendarId, calendarName, userId) {
     createdBy: userId,
     updatedAt: Date.now(),
     daily: { enabled: true, time: 9 * 60, scope: 'all', days: WEEKDAYS.slice(), empty: 'skip' },
-    reminder: { enabled: false, offset: 15, allDayTime: 9 * 60, days: WEEKDAYS.slice() },
+    reminder: { enabled: false, offset: 15, allDay: false, allDayTime: 9 * 60, days: WEEKDAYS.slice() },
     changes: defaultChanges_(),
   };
 }
@@ -1069,7 +1265,7 @@ function runTest_(chId, conn, userId) {
   if (conn.reminder.enabled) {
     mergeItems_(reminderItems_(conn, infos, -Infinity, Infinity, day, color))
       .sort((a, b) => a.at - b.at)
-      .forEach((item) => messages.push({ routine: '일정별 알림', text: '', attachments: item.attachments }));
+      .forEach((item) => messages.push({ routine: '일정 알림', text: '', attachments: item.attachments }));
   }
   say(`*${name}*, *${formatDay_(day)}* 에 등록된 일정입니다.`);
   messages.slice(0, TEST_MESSAGE_LIMIT).forEach((m) => say(m.text, m.attachments));
@@ -1086,17 +1282,32 @@ function runTest_(chId, conn, userId) {
 
 const CHANGE_WAITS = [0, 1, 3]; // 분
 const CHANGE_KINDS = { created: '등록', updated: '변경', deleted: '삭제' };
-const CHANGE_EMOJI = { created: '🆕', updated: '✏️', deleted: '🗑️' };
 const SNAPSHOT_KEEP = 30 * DAY; // 이보다 오래 지난 일정의 요약은 지웁니다(저장 공간 절약).
 const CHUNK_SIZE = 2500; // 스크립트 속성 한 칸(9KB)에 한글이 들어가도 넘지 않는 글자 수
 
+/**
+ * days: 변경 알림을 보내는 요일(보내는 날 기준).
+ * hold: 고르지 않은 요일에 생긴 알림을 모아 두었다가 돌아오는 첫 요일의 holdTime에 보낼지. 끄면 그 알림은 보내지 않습니다.
+ */
 function defaultChanges_() {
-  return { enabled: false, types: [], wait: 1, past: false, since: 0 };
+  return { enabled: false, types: [], wait: 1, past: false, since: 0, days: WEEKDAYS.slice(), hold: false, holdTime: 9 * 60 };
 }
 
-/** 2단계 이전에 만든 연결에는 changes가 없어 기본값으로 채웁니다. */
+/** 예전에 만든 연결에는 없는 값을 기본값으로 채웁니다. 요일이 생기기 전 연결은 매일 보내던 대로 둡니다. */
 function changesOf_(conn) {
-  return Object.assign(defaultChanges_(), conn.changes || {});
+  const saved = conn.changes || {};
+  const c = Object.assign(defaultChanges_(), saved);
+  if (conn.changes && !saved.days) c.days = [0, 1, 2, 3, 4, 5, 6];
+  return c;
+}
+
+/** 고르지 않은 요일에 모은 알림을 보낼 시각: now 다음으로 오는 고른 요일의 holdTime */
+function nextHoldRelease_(settings, now) {
+  for (let i = 1; i <= 7; i++) {
+    const day = kstDayStart_(now) + i * DAY;
+    if (settings.days.includes(kstParts_(day).dow)) return day + settings.holdTime * MINUTE;
+  }
+  return null;
 }
 
 /** 캘린더 ID → 변경 알림을 켠 연결 목록 */
@@ -1208,6 +1419,7 @@ function snapshot_(ev) {
     e: time.end,
     a: time.allDay ? 1 : 0,
     r: ev.recurrence ? 1 : 0,
+    rt: ev.recurrence ? describeRecurrence_(ev.recurrence, time.start) : undefined, // 삭제 알림에 쓸 반복 규칙 문장
     h: hash_([title, JSON.stringify(ev.start), JSON.stringify(ev.end), ev.description || ''].join('\u0001')),
   };
 }
@@ -1264,6 +1476,10 @@ function changeOf_(calendarId, ev, snap, kind, now) {
     // 반복 일정은 다음 회차를 보여 줍니다. 다음 회차가 없으면 끝난 반복 일정입니다.
     const next = nextOccurrence_(calendarId, ev.id, now);
     if (next) Object.assign(info, next);
+    info.recurrence = describeRecurrence_(ev.recurrence, snap.s);
+  } else if (ev.recurringEventId) {
+    // 반복 일정의 한 회차만 바꾼 경우에도 어떤 반복 일정인지 보여 줍니다.
+    info.recurrence = recurrenceText_(calendarId, ev.recurringEventId, snap.s);
   }
   return { id: ev.id, kind, info, past: snap.r ? !info.upcoming : info.end < now };
 }
@@ -1281,7 +1497,7 @@ function nextOccurrence_(calendarId, eventId, now) {
 }
 
 function infoFromSnap_(snap) {
-  return { title: snap.t, start: snap.s, end: snap.e, allDay: !!snap.a, recurring: !!snap.r, link: null, description: '' };
+  return { title: snap.t, start: snap.s, end: snap.e, allDay: !!snap.a, recurring: !!snap.r, recurrence: snap.rt || null, link: null, description: '' };
 }
 
 function pruneSnapshots_(state, now) {
@@ -1310,7 +1526,10 @@ function queueChanges_(watchers, changes, now) {
           delete pending[key];
           return;
         }
+        // 이미 다음 요일로 미뤄 둔 알림이면 그 시각(holdUntil)을 유지합니다.
+        const holdUntil = pending[key] && pending[key].holdUntil;
         pending[key] = { chId, connId: conn.id, kind, info: change.info, past: change.past, at: now };
+        if (holdUntil) pending[key].holdUntil = holdUntil;
       });
     });
     saveChunked_('PENDING', pending);
@@ -1335,6 +1554,14 @@ function dispatchChanges_(now) {
         return;
       }
       if (now < p.at + settings.wait * MINUTE) return; // 아직 기다리는 중
+      if (p.holdUntil && now < p.holdUntil) return; // 다음 요일로 미뤄 둔 알림
+      if (!p.holdUntil && !settings.days.includes(kstParts_(now).dow)) {
+        // 고르지 않은 요일: 모아 보내기를 켰으면 돌아오는 첫 요일로 미루고, 아니면 보내지 않습니다.
+        const release = settings.hold && nextHoldRelease_(settings, now);
+        if (release) p.holdUntil = release;
+        else delete pending[key];
+        return;
+      }
       delete pending[key];
       if (!settings.types.includes(p.kind)) return;
       if (p.past && !settings.past) return;
@@ -1343,19 +1570,13 @@ function dispatchChanges_(now) {
     saveChunked_('PENDING', pending);
   });
 
-  const groups = {};
-  ready.forEach((p) => {
-    const key = `${p.chId}|${p.connId}|${p.kind}`;
-    (groups[key] = groups[key] || []).push(p);
-  });
+  // 등록·변경·삭제는 일정마다 메시지를 따로 보냅니다(같은 시각이어도 묶지 않습니다). 일정 시각 순서로 보냅니다.
   const colors = {};
-  Object.keys(groups).forEach((key) => {
-    const items = groups[key].sort((a, b) => a.info.start - b.info.start);
-    const { chId, conn, kind } = items[0];
+  ready.sort((a, b) => a.info.start - b.info.start).forEach((p) => {
+    const { chId, conn, kind } = p;
     if (!(conn.calendarId in colors)) colors[conn.calendarId] = calendarColor_(openCalendar_(conn.calendarId));
     try {
-      changeMessages_(conn, colors[conn.calendarId], kind, items.map((p) => p.info))
-        .forEach((attachments) => postMessage_(chId, '', attachments));
+      postMessage_(chId, '', [changeMessage_(conn, colors[conn.calendarId], kind, p.info)]);
     } catch (err) {
       failures.push(`${chId}: ${err.message}`);
       handleSendFailure_(chId, err);
@@ -1364,17 +1585,11 @@ function dispatchChanges_(now) {
   return failures;
 }
 
-/** "🆕 일정 등록 | 캘린더 | 총 n건" 머리글 + 일정마다 색 막대. 50건이 넘으면 나눠 보냅니다. */
-function changeMessages_(conn, color, kind, infos) {
-  const messages = [];
-  for (let i = 0; i < infos.length; i += MESSAGE_ATTACHMENT_LIMIT) {
-    messages.push(infos.slice(i, i + MESSAGE_ATTACHMENT_LIMIT).map((info, index) => {
-      const attachment = changeAttachment_(conn, color, kind, info);
-      if (index === 0) attachment.pretext = `${CHANGE_EMOJI[kind]} *일정 ${CHANGE_KINDS[kind]}* | ${escapeSlack_(conn.calendarName)} | 총 ${infos.length}건`;
-      return attachment;
-    }));
-  }
-  return messages;
+/** "일정 등록 | 캘린더" 머리글 + 일정 한 줄(색 막대) */
+function changeMessage_(conn, color, kind, info) {
+  const attachment = changeAttachment_(conn, color, kind, info);
+  attachment.pretext = `*일정 ${CHANGE_KINDS[kind]}* | ${escapeSlack_(conn.calendarName)}`;
+  return attachment;
 }
 
 function changeAttachment_(conn, color, kind, info) {
@@ -1386,14 +1601,16 @@ function changeAttachment_(conn, color, kind, info) {
   const when = info.allDay ? '종일' : `${formatClock_(info.start)} - ${formatClock_(info.end)}`;
   const title = escapeSlack_(info.title);
   const linked = info.link && kind !== 'deleted' ? `<${info.link}|${title}>` : title;
-  const line = `${date ? `${date} ` : ''}${when} ${linked}${info.recurring ? ' (반복)' : ''}`;
+  // 반복 규칙 문장(작은 회색 줄)을 만들지 못했을 때만 제목 뒤에 "(반복)"을 붙입니다.
+  const line = `${date ? `${date} ` : ''}${when} ${linked}${info.recurring && !info.recurrence ? ' (반복)' : ''}`;
   const attachment = {
     // 삭제된 일정은 날짜·시간·제목 줄 전체에 취소선을 긋습니다.
     text: kind === 'deleted' ? `~${line}~` : line,
     fallback: `${conn.calendarName} · 일정 ${CHANGE_KINDS[kind]} · ${info.title}`,
     mrkdwn_in: ['pretext', 'text'],
   };
-  return withColor_(kind === 'deleted' ? attachment : withDescription_(attachment, info), color);
+  // 삭제 알림에는 설명 없이 반복 규칙만 작은 회색 줄로 남깁니다.
+  return withColor_(withDescription_(attachment, kind === 'deleted' ? { recurrence: info.recurrence } : info), color);
 }
 
 function calendarStateKey_(calendarId) {
@@ -1542,7 +1759,10 @@ function loadMeta_() {
 }
 
 function loadChannel_(chId) {
-  return chId ? loadJson_(`CH_${chId}`, null) : null;
+  const ch = chId ? loadJson_(`CH_${chId}`, null) : null;
+  // "종일 일정 알림" 켜짐/꺼짐이 생기기 전의 연결은 종일 일정도 알렸으므로 켜짐으로 읽습니다.
+  if (ch) ch.connections.forEach((conn) => { if (conn.reminder && conn.reminder.allDay === undefined) conn.reminder.allDay = true; });
+  return ch;
 }
 
 function newChannel_(chId) {
@@ -1775,12 +1995,12 @@ function select_(options, value) {
   return { type: 'static_select', options, initial_option: findOption_(options, value) };
 }
 
+/** "월-금", "매일", "월, 화, 금" */
 function describeDays_(days) {
   const sorted = WEEK_ORDER.filter((d) => days.includes(d));
   if (sorted.length === 7) return '매일';
-  if (sorted.join() === WEEKDAYS.join()) return '평일';
-  if (sorted.join() === '6,0') return '주말';
-  return sorted.map((d) => DAY_NAMES[d]).join('·');
+  if (sorted.join() === WEEKDAYS.join()) return '월-금';
+  return sorted.map((d) => DAY_NAMES[d]).join(', ');
 }
 
 function offsetChoiceLabel_(offset) {
@@ -1789,93 +2009,140 @@ function offsetChoiceLabel_(offset) {
   return `${offset}분 전`;
 }
 
-/** "• [하루 요약] 오후 6:10에 발송 | 모든 일정 | 평일 | 일정 없음 표시 안 함" */
+// 채널 설정 화면의 루틴 요약 한 줄씩. 맨 앞에 이모지와 루틴 이름을 붙입니다.
+const SEP = '  |  ';
+
+/** "📅 하루 요약 (월-금)  |  오전 7:00  |  모든 일정  |  일정없음 알림 O" (요일은 일정 알림처럼 이름 옆에) */
 function describeDaily_(d) {
   if (!d.enabled) return null;
-  return `• *[하루 요약]* ${formatAmPm_(d.time)}에 발송 | ${DAILY_SCOPES[d.scope]} | ${describeDays_(d.days)} | ${d.empty === 'send' ? '일정 없음 표시함' : '일정 없음 표시 안 함'}`;
+  return [`📅 하루 요약 (${describeDays_(d.days)})`, formatAmPm_(d.time), DAILY_SCOPES[d.scope], `일정없음 알림 ${d.empty === 'send' ? 'O' : 'X'}`].join(SEP);
 }
 
-/** "• [일정별 알림] 시작 시간에 발송 | [종일일정 알림] 오후 6:12에 발송 | 평일" */
+/**
+ * "🔔 일정 알림 (월, 화, 금)  |  일정 5분 전에  |  종일 일정 알림 O (오후 2:00)"
+ * 요일은 시간 일정과 종일 일정에 함께 적용되므로, 줄 끝이 아니라 루틴 이름 옆에 적습니다.
+ */
 function describeReminder_(r) {
   if (!r.enabled) return null;
-  const when = r.offset === 0 ? '시작 시간에' : `${offsetChoiceLabel_(r.offset)}`;
-  return `• *[일정별 알림]* ${when} 발송 | *[종일일정 알림]* ${formatAmPm_(r.allDayTime)}에 발송 | ${describeDays_(r.days)}`;
+  const when = r.offset === 0 ? '일정 시작 시간에' : `일정 ${offsetChoiceLabel_(r.offset)}에`;
+  const allDay = r.allDay ? `종일 일정 알림 O (${formatAmPm_(r.allDayTime)})` : '종일 일정 알림 X';
+  return [`🔔 일정 알림 (${describeDays_(r.days)})`, when, allDay].join(SEP);
 }
 
-/** "• [변경 알림] 등록·변경·삭제 | 1분 대기 후 발송 | 지난 일정 알리지 않음" */
+/** "✏️ 변경 알림 (월-금)  |  등록, 삭제만  |  1분 대기 후 알림  |  과거 일정 변경 알림 X  |  설정요일 외 변경 재알림 O (오전 9:00)" */
 function describeChanges_(c) {
   if (!c.enabled) return null;
-  const types = Object.keys(CHANGE_KINDS).filter((k) => c.types.includes(k)).map((k) => CHANGE_KINDS[k]).join('·');
-  return `• *[변경 알림]* ${types} | ${changeWaitLabel_(c.wait)} 발송 | 지난 일정 ${c.past ? '알림' : '알리지 않음'}`;
+  const picked = Object.keys(CHANGE_KINDS).filter((k) => c.types.includes(k)).map((k) => CHANGE_KINDS[k]);
+  const types = picked.length === Object.keys(CHANGE_KINDS).length ? picked.join(', ') : `${picked.join(', ')}만`;
+  const held = c.hold ? `설정요일 외 변경 재알림 O (${formatAmPm_(c.holdTime)})` : '설정요일 외 변경 재알림 X';
+  return [`✏️ 변경 알림 (${describeDays_(c.days)})`, types, `${changeWaitLabel_(c.wait)} 알림`, `과거 일정 변경 알림 ${c.past ? 'O' : 'X'}`, held].join(SEP);
 }
 
 function changeWaitLabel_(wait) {
   return wait === 0 ? '즉시' : `${wait}분 대기 후`;
 }
 
+/** 알림 중일 때는 상태 줄을 따로 보여 주지 않습니다. */
 function connectionStatus_(conn) {
   // Slack에는 :pause_button: 이름이 없어(⏸는 :double_vertical_bar:) 문자 그대로 넣습니다.
-  if (conn.paused) return conn.pausedReason === 'removed' ? '⏸️ 봇이 채널에서 나가 일시정지됨' : '⏸️ 일시정지';
+  if (conn.paused) return conn.pausedReason === 'removed' ? '⏸️ 봇이 채널에서 나가 일시정지 중' : '⏸️ 일시정지 중';
   if (conn.error === 'calendar') return ':warning: 캘린더 접근 불가';
-  return ':large_green_circle: 알림 중';
+  return null;
 }
 
+/** 캘린더 이름에 거는 링크. 캘린더를 볼 권한이 있는 사람만 열 수 있습니다. */
+function calendarLink_(calendarId) {
+  return `https://calendar.google.com/calendar/embed?src=${encodeURIComponent(calendarId)}&ctz=${encodeURIComponent(TIME_ZONE)}`;
+}
+
+/** 변경 기록 한 건: "*디자인팀  |  알림 설정 변경*\n@사람  |  2026/11/09 오후 8:12" */
 function formatLog_(entry) {
-  return `${formatLogTime_(entry.at)}  ${entry.user ? `<@${entry.user}>` : 'checky-bot'}  ${entry.text}`;
+  const at = entry.text.indexOf(': ');
+  const head = at > 0 ? `${entry.text.slice(at + 2)}${SEP}${entry.text.slice(0, at)}` : entry.text;
+  return `*${head}*\n${entry.user ? `<@${entry.user}>` : 'checky-bot'}${SEP}${formatLogTime_(entry.at)}`;
 }
 
 function channelModal_(chId, userId) {
   const ch = loadChannel_(chId) || newChannel_(chId);
   const admin = isAdmin_(ch, userId);
-  // 채널 이름 / 연결마다 / 캘린더 추가 버튼 / 관리자 / 최근 변경을 구분선으로 나눕니다.
-  const blocks = [section_(`*<#${chId}>* 채널 알림 설정`), { type: 'divider' }];
+  const top = section_(`현재 채널: <#${chId}>`);
+  if (admin) top.accessory = Object.assign(button_('캘린더 추가', 'add_conn', 'add'), { style: 'primary' });
+  // 채널봇 관리자는 맨 위 "현재 채널" 바로 아래에 둡니다.
+  const admins = section_(`관리자: ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
+  if (admin) admins.accessory = button_('관리자 변경', 'edit_admins', 'admins');
+  const blocks = [top, admins, { type: 'divider' }];
 
   if (!ch.connections.length) blocks.push(context_('연결된 캘린더가 없습니다.'), { type: 'divider' });
   ch.connections.forEach((conn) => {
-    const summary = section_([
-      `*${escapeSlack_(conn.calendarName)}* | ${connectionStatus_(conn)}`,
-      describeDaily_(conn.daily),
-      describeReminder_(conn.reminder),
-      describeChanges_(changesOf_(conn)),
-    ].filter(Boolean).join('\n')); // 꺼 둔 루틴은 줄을 빼고 보여 줍니다.
-    blocks.push(summary);
+    // 캘린더 이름(구글 캘린더 링크) + 켜 둔 루틴 요약 + 일시정지·오류일 때만 상태 줄. 꺼 둔 루틴은 줄을 뺍니다.
+    // 일시정지 중이면 루틴 줄마다 취소선을 긋습니다.
+    const routines = [describeDaily_(conn.daily), describeReminder_(conn.reminder), describeChanges_(changesOf_(conn))]
+      .filter(Boolean)
+      .map((line) => (conn.paused ? `~${line}~` : line));
+    const summary = section_(`*<${calendarLink_(conn.calendarId)}|${escapeSlack_(conn.calendarName)}>*`);
     if (admin) {
-      // 삭제는 실수로 누르지 않게 ⚙️ 설정 화면 맨 아래에 둡니다.
+      summary.accessory = {
+        type: 'overflow',
+        action_id: 'conn_menu',
+        options: [
+          { text: plain_('⚙️ 설정'), value: `settings|${conn.id}` },
+          { text: plain_('구글 캘린더 열기'), value: `open|${conn.id}`, url: calendarLink_(conn.calendarId) },
+          { text: plain_('연결 끊기'), value: `delete|${conn.id}` },
+        ],
+      };
+    }
+    blocks.push(summary);
+    // 루틴 줄과 상태 줄은 작은 회색 글씨(context 블록)로 보여 줍니다.
+    const details = [...routines, connectionStatus_(conn)].filter(Boolean);
+    if (details.length) blocks.push(context_(details.join('\n')));
+    if (admin) {
       blocks.push({
         type: 'actions',
         elements: [
-          button_('테스트 메시지 발송', 'test_conn', conn.id),
-          button_(conn.paused ? '다시 시작' : '일시정지', 'toggle_conn', conn.id),
-          button_('캘린더 변경', 'change_calendar', conn.id),
+          button_('연결상태 테스트', 'test_conn', conn.id),
+          Object.assign(button_(conn.paused ? '다시 시작' : '일시정지', 'toggle_conn', conn.id), conn.paused ? { style: 'primary' } : {}),
+          button_('캘린더 바꾸기', 'change_calendar', conn.id),
           button_('⚙️ 설정', 'edit_conn', conn.id),
         ],
       });
     }
     blocks.push({ type: 'divider' });
   });
-  if (admin) {
-    // Slack 버튼은 너비·정렬을 정할 수 없어, 빈 줄로 위아래 여백만 줍니다.
-    blocks.push(
-      section_('\n　\n'),
-      { type: 'actions', elements: [Object.assign(button_('+ 캘린더 추가', 'add_conn', 'add'), { style: 'primary' })] },
-      section_('\n　\n'),
-      { type: 'divider' },
-    );
-  }
 
-  const admins = section_(`*채널봇 관리자*\n${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
-  if (admin) admins.accessory = button_('변경', 'edit_admins', 'admins');
-  blocks.push(admins);
-  if (!admin) blocks.push(context_('설정은 이 채널의 관리자만 바꿀 수 있습니다.'));
-  if (ch.log.length) blocks.push({ type: 'divider' }, context_(`*최근 변경*\n${ch.log.slice(0, 5).map(formatLog_).join('\n')}`));
+  // 연결 목록은 구분선으로 끝나므로, 변경사항은 바로 이어 붙입니다.
+  if (ch.log.length) {
+    // 연결 목록과 변경사항 사이 여백. Slack 블록에는 여백 설정이 없어 작은 빈 이미지로 띄웁니다.
+    blocks.push({ type: 'context', elements: [{ type: 'image', image_url: SPACER_IMAGE, alt_text: ' ' }] });
+    blocks.push(context_('변경사항 (최근 5건까지 표시)'));
+    ch.log.slice(0, 5).forEach((entry, i) => {
+      if (i > 0) blocks.push({ type: 'divider' });
+      blocks.push(context_(formatLog_(entry))); // 작은 회색 글씨
+    });
+  }
 
   return {
     type: 'modal',
     callback_id: 'channel',
-    title: plain_('checky-bot 설정'),
+    title: plain_('Checky Bot 설정'),
     close: plain_('닫기'),
     private_metadata: JSON.stringify({ channelId: chId }),
     blocks,
+  };
+}
+
+/** [⋯] > 연결 끊기를 누르면 여는 확인 창 */
+function disconnectModal_(chId, conn, parentViewId) {
+  return {
+    type: 'modal',
+    callback_id: 'disconnect',
+    title: plain_('연결 끊기'),
+    submit: plain_('연결 끊기'),
+    close: plain_('취소'),
+    private_metadata: JSON.stringify({ channelId: chId, connId: conn.id, parentViewId }),
+    blocks: [
+      section_(`*${escapeSlack_(conn.calendarName)}* 캘린더와 <#${chId}> 채널의 연결을 끊을까요?`),
+      context_('알림 설정도 함께 지워지며 되돌릴 수 없습니다. 캘린더의 일정은 지워지지 않습니다.'),
+    ],
   };
 }
 
@@ -1914,7 +2181,7 @@ function changeCalendarModal_(chId, conn, parentViewId) {
 /**
  * 알림 설정 화면. draft는 저장 전 고른 값이며, 없으면 저장된 설정으로 그립니다.
  * Slack에는 토글 스위치가 없어 켜기/끄기는 버튼으로 만들고, 누를 때마다 화면을 다시 그립니다(editDraft_).
- * 꺼진 루틴은 세부 항목을 숨깁니다. 하루 요약과 일정별 알림은 탭 버튼으로 나눠 한쪽만 보여 줍니다.
+ * 꺼진 루틴은 세부 항목을 숨깁니다. 하루 요약과 일정 알림은 탭 버튼으로 나눠 한쪽만 보여 줍니다.
  */
 function connModal_(chId, conn, parentViewId, draft) {
   draft = draft || JSON.parse(JSON.stringify({ daily: conn.daily, reminder: conn.reminder, changes: changesOf_(conn) }));
@@ -1928,57 +2195,57 @@ function connModal_(chId, conn, parentViewId, draft) {
   const offsets = REMINDER_OFFSETS.map((o) => option_(offsetChoiceLabel_(o), o));
 
   const tab = ['reminder', 'changes'].includes(draft.tab) ? draft.tab : 'daily';
-  const tabButton = (name, label, enabled) => {
-    const b = button_(`${label} | ${enabled ? '켜짐' : '꺼짐'}`, `tab_${name}`, name);
-    if (tab === name) b.style = 'primary';
-    return b;
-  };
+  // 알림 유형 드롭다운: 고른 유형의 설정만 보여 줍니다. 숨긴 유형의 값은 draft에 남아 함께 저장됩니다.
+  // 드롭다운 항목은 일반 글자라 굵게(*) 표시할 수 없습니다.
+  const kinds = [
+    option_(`📅 하루 요약  |  ${d.enabled ? '켜짐' : '꺼짐'}`, 'daily'),
+    option_(`🔔 일정 알림  |  ${r.enabled ? '켜짐' : '꺼짐'}`, 'reminder'),
+    option_(`✏️ 변경 알림  |  ${c.enabled ? '켜짐' : '꺼짐'}`, 'changes'),
+  ];
   const blocks = [
-    // 맨 위 "캘린더 → 채널" 줄 오른쪽에 [연결 삭제]를 둡니다. Slack 모달 아래쪽 [닫기]/[저장] 영역에는
-    // 버튼을 더할 수 없고, 글자 링크로는 봇 동작을 실행할 수 없어 버튼으로 붙입니다.
-    Object.assign(section_(`*${escapeSlack_(conn.calendarName)}* → <#${chId}>`), {
+    // 맨 위 줄 오른쪽에 [연결 끊기]를 둡니다. Slack 모달 아래쪽 [취소]/[저장] 영역에는 버튼을 더할 수 없습니다.
+    Object.assign(section_(`*${escapeSlack_(conn.calendarName)}* 일정을 <#${chId}>에 발송합니다.`), {
       block_id: 'danger',
-      accessory: Object.assign(button_('연결 삭제', 'delete_conn', conn.id), {
+      accessory: Object.assign(button_('연결 끊기', 'delete_conn', conn.id), {
         style: 'danger',
-        confirm: confirm_('연결 삭제', `${conn.calendarName} 연결을 삭제할까요? 알림 설정도 함께 지워지며 되돌릴 수 없습니다.`, '삭제'),
+        confirm: confirm_('연결 끊기', `${conn.calendarName} 연결을 끊을까요? 알림 설정도 함께 지워지며 되돌릴 수 없습니다.`, '연결 끊기'),
       }),
     }),
-    // 탭: 고른 쪽 설정만 보여 줍니다. 숨긴 탭의 값은 draft에 남아 함께 저장됩니다.
-    {
-      type: 'actions',
+    Object.assign(section_('알림 유형'), {
       block_id: 'tabs',
-      elements: [
-        tabButton('daily', '📅 하루 요약', d.enabled),
-        tabButton('reminder', '🔔 일정별 알림', r.enabled),
-        tabButton('changes', '✏️ 변경 알림', c.enabled),
-      ],
-    },
+      accessory: { type: 'static_select', action_id: 'pick_tab', options: kinds, initial_option: findOption_(kinds, tab) },
+    }),
   ];
   // 경고는 숨긴 탭의 문제도 보이도록 탭 바로 아래에 둡니다.
-  if (problems.none) blocks.push(context_(':warning: 하루 요약, 일정별 알림, 변경 알림 중 하나 이상 켜야 저장됩니다.'));
+  if (problems.none) blocks.push(context_(':warning: 하루 요약, 일정 알림, 변경 알림 중 하나 이상 켜야 저장됩니다.'));
   if (problems.daily) blocks.push(context_(':warning: 하루 요약의 요일을 하나 이상 고르세요.'));
-  if (problems.reminder) blocks.push(context_(':warning: 일정별 알림의 요일을 하나 이상 고르세요.'));
+  if (problems.reminder) blocks.push(context_(':warning: 일정 알림의 요일을 하나 이상 고르세요.'));
   if (problems.changes) blocks.push(context_(':warning: 변경 알림의 알림 종류를 하나 이상 고르세요.'));
+  if (problems.changesDays) blocks.push(context_(':warning: 변경 알림의 요일을 하나 이상 고르세요.'));
   blocks.push({ type: 'divider' });
 
   if (tab === 'daily') {
     blocks.push(routineHeader_('daily', '*하루 요약*\n정한 시각에 그날 일정을 한 번에 보냅니다.', d.enabled));
     if (d.enabled) {
+      // 채널 설정 화면의 요약 줄과 같은 순서: 요일 → 시각 → 범위 → 그 밖의 설정
       blocks.push(
+        dayPicker_('daily', d.days),
         timePicker_('daily_time', '보내는 시각', d.time),
         input_('daily_scope', '범위', select_(scopes, d.scope)),
-        dayPicker_('daily', d.days),
         input_('daily_empty', '일정이 없는 날', { type: 'radio_buttons', options: empties, initial_option: findOption_(empties, d.empty) }),
       );
     }
   } else if (tab === 'reminder') {
-    blocks.push(routineHeader_('reminder', '*일정별 알림*\n일정마다 정한 시점에 알립니다. 요일은 일정이 있는 날 기준입니다.', r.enabled));
+    blocks.push(routineHeader_('reminder', '*일정 알림*\n일정마다 정한 시점에 알립니다. 요일은 일정이 있는 날 기준입니다.', r.enabled));
     if (r.enabled) {
-      blocks.push(
-        input_('reminder_offset', '시간 일정 알림 시점', select_(offsets, r.offset)),
-        timePicker_('reminder_allday_time', '종일 일정 알림 시각', r.allDayTime),
-        dayPicker_('reminder', r.days),
-      );
+      // 요약 줄과 같은 순서: 요일 → 알림 시점 → 종일 일정 알림
+      blocks.push(dayPicker_('reminder', r.days), input_('reminder_offset', '시간 일정 알림 시점', select_(offsets, r.offset)));
+      // 종일 일정은 시작 시각이 없어 따로 켜고, 켜면 알릴 시각을 고릅니다.
+      const allDay = section_('*종일 일정 알림*\n종일 일정은 정한 시각에 알립니다.');
+      allDay.block_id = 'reminder_allday_enabled';
+      allDay.accessory = Object.assign(button_(r.allDay ? '● 켜짐' : '○ 꺼짐', 'toggle_routine', 'allday'), r.allDay ? { style: 'primary' } : {});
+      blocks.push(allDay);
+      if (r.allDay) blocks.push(timePicker_('reminder_allday_time', '종일 일정 알림 시각', r.allDayTime));
     }
   } else {
     blocks.push(routineHeader_('changes', '*변경 알림*\n일정이 등록·변경·삭제되면 알립니다. 이어서 고치면 마지막 변경 뒤 정한 시간만큼 기다렸다가 최종 내용만 보냅니다.', c.enabled));
@@ -1989,12 +2256,18 @@ function connModal_(chId, conn, parentViewId, draft) {
       if (picked.length) kindPicker.initial_options = picked;
       const waits = CHANGE_WAITS.map((w) => option_(changeWaitLabel_(w), w));
       const pasts = [option_('알리지 않음', 'off'), option_('알림', 'on')];
+      // 요약 줄과 같은 순서: 요일 → 알림 종류 → 발송 시점 → 과거 일정 → 고르지 않은 요일의 알림
       blocks.push(
+        dayPicker_('changes', c.days),
         input_('changes_types', '알림 종류', kindPicker),
         input_('changes_wait', '발송 시점', select_(waits, c.wait)),
-        input_('changes_past', '이미 지난 일정', { type: 'radio_buttons', options: pasts, initial_option: findOption_(pasts, c.past ? 'on' : 'off') }),
-        context_('변경 알림을 켠 뒤의 변경부터 알립니다. 비공개 일정은 알리지 않습니다.'),
+        input_('changes_past', '과거 일정에 대한 변경 알림', { type: 'radio_buttons', options: pasts, initial_option: findOption_(pasts, c.past ? 'on' : 'off') }),
       );
+      const hold = section_('*고르지 않은 요일의 알림*\n고르지 않은 요일에 생긴 변경을 모아 두었다가 돌아오는 첫 요일에 보냅니다. 끄면 그 알림은 보내지 않습니다.');
+      hold.block_id = 'changes_hold_enabled';
+      hold.accessory = Object.assign(button_(c.hold ? '● 켜짐' : '○ 꺼짐', 'toggle_routine', 'hold'), c.hold ? { style: 'primary' } : {});
+      blocks.push(hold);
+      if (c.hold) blocks.push(timePicker_('changes_hold_time', '모아 보내는 시각', c.holdTime));
     }
   }
 
@@ -2077,13 +2350,14 @@ function installerModal_(userId) {
   return {
     type: 'modal',
     callback_id: 'installer',
-    title: plain_('앱 관리자 변경'),
+    title: plain_('앱 설치자 변경'),
     submit: plain_('저장'),
     close: plain_('취소'),
     blocks: [
-      input_('installer', '앱 관리자', { type: 'users_select', initial_user: userId }),
-      context_('서비스에 문제가 생기면 앱 관리자에게 DM이 발송됩니다.'),
+      input_('installer', '앱 설치자', { type: 'users_select', initial_user: userId }),
+      context_('서비스에 문제가 생기면 앱 설치자에게 DM이 발송됩니다.'),
       { type: 'divider' },
+      section_('*문제 발생 시*\n설치자 권한 변경 시, 다음 스크립트를 참조합니다.'),
       context_('<https://github.com/boeunde/checky-bot|github.com/boeunde/checky-bot>　|　MIT License'),
     ],
   };
@@ -2098,10 +2372,10 @@ function publishHome_(userId) {
       '\n　\n*사용 방법*',
       '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`',
       '2. 해당 채널에서 `/checky` 명령어를 입력하고 캘린더를 연결합니다.',
-      '3. 캘린더마다 알림 루틴을 설정합니다.\n　\n',
+      '3. 캘린더마다 알림 루틴을 설정합니다.',
     ].join('\n')),
     { type: 'divider' },
-    section_('\n　\n*연결된 채널*\n현재 연결된 채널과 그에 따른 설정은 다음과 같습니다.\n　\n'),
+    section_('\n　\n*연결된 채널*\n현재 연결된 채널과 그에 따른 설정은 다음과 같습니다.'),
   ];
 
   // 캘린더가 연결된 채널과 내가 관리자인 채널을 보여 주고, 관리자인 채널에는 [설정] 버튼을 붙입니다.
@@ -2110,15 +2384,15 @@ function publishHome_(userId) {
     .filter((ch) => ch && (ch.connections.length || isAdmin_(ch, userId)))
     .slice(0, HOME_CHANNEL_LIMIT);
   channels.forEach((ch) => {
-    const row = section_(`　●　<#${ch.id}>　|　캘린더 ${ch.connections.length}개　|　채널봇 관리자 ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
+    const row = section_(`●  <#${ch.id}>\n　 캘린더 ${ch.connections.length}개${SEP}관리자 ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
     if (isAdmin_(ch, userId)) row.accessory = button_('설정', 'open_channel', ch.id);
     blocks.push(row);
   });
   if (!channels.length) blocks.push(context_('아직 캘린더를 연결한 채널이 없습니다.'));
 
-  // 앱 관리자(설치자)는 채널 목록 아래에 둡니다.
-  blocks.push({ type: 'divider' }, section_('\n　\n*앱 관리자*\n서비스에 문제가 생기면 앱 관리자에게 DM이 발송됩니다.\n　\n'));
-  const installer = section_(`${meta.installer ? `　●　<@${meta.installer}>` : '아직 없음'}`);
+  // 앱 설치자는 채널 목록 아래에 둡니다.
+  blocks.push({ type: 'divider' }, section_('\n　\n*앱 설치자*\n문제가 발생하면 시스템이 앱 설치자에게 DM을 전송합니다.\n설치자 권한은 다른 사람으로 변경할 수 있습니다.'));
+  const installer = section_(meta.installer ? `●  <@${meta.installer}>` : '●  아직 없음');
   if (meta.installer === userId) installer.accessory = button_('변경', 'transfer_installer', 'installer');
   blocks.push(installer, { type: 'divider' });
   slackApi_('views.publish', { user_id: userId, view: { type: 'home', blocks } });

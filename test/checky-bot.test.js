@@ -62,7 +62,7 @@ function createEnv(nowIso) {
       created: new RealDate(ev.created || 0).toISOString(),
       updated: new RealDate(ev.updated || 0).toISOString(),
       htmlLink: `https://calendar.example/${ev.id}`,
-      recurrence: ev.recurring ? ['RRULE:FREQ=WEEKLY'] : undefined,
+      recurrence: ev.recurring ? [ev.rrule || 'RRULE:FREQ=WEEKLY'] : undefined,
       attendees: ev.attendees,
       recurringEventId: ev.recurringEventId,
     };
@@ -124,6 +124,12 @@ function createEnv(nowIso) {
             .filter((ev) => (opts.syncToken ? (ev.seq || 0) > since : !ev.deleted))
             .map((ev) => apiEvent(calId, ev));
           return { items, nextSyncToken: String(cal.seq || 0) };
+        },
+        get: (calId, id) => {
+          state.apiCalls.push({ calId, get: id });
+          const ev = state.calendars[calId].events.find((e) => e.id === id);
+          if (!ev) throw new Error('Not Found');
+          return { recurrence: ev.recurring ? [ev.rrule || 'RRULE:FREQ=WEEKLY'] : undefined };
         },
         instances: (calId, id) => {
           const ev = state.calendars[calId].events.find((e) => e.id === id);
@@ -223,20 +229,20 @@ const allDay = (id, title, startDate, endDateExclusive, extra = {}) => ev(id, ti
 // Values are only present for routines that are on, as hidden blocks send nothing.
 function settingsForm({ daily = {}, reminder = {}, changes = {} } = {}) {
   const d = Object.assign({ enabled: true, time: 540, scope: 'all', days: [1, 2, 3, 4, 5], empty: 'skip' }, daily);
-  const r = Object.assign({ enabled: false, offset: 15, allDayTime: 540, days: [1, 2, 3, 4, 5] }, reminder);
-  const c = Object.assign({ enabled: false, types: [], wait: 1, past: false }, changes);
+  const r = Object.assign({ enabled: false, offset: 15, allDay: true, allDayTime: 540, days: [1, 2, 3, 4, 5] }, reminder);
+  const c = Object.assign({ enabled: false, types: [], wait: 1, past: false, days: [0, 1, 2, 3, 4, 5, 6], hold: false, holdTime: 540 }, changes);
   const one = (v) => ({ selected_option: { value: String(v) } });
   const pad = (n) => String(n).padStart(2, '0');
   const time = (m) => ({ v: { selected_time: `${pad(Math.floor(m / 60))}:${pad(m % 60)}` } });
   const many = (arr) => ({ v: { selected_options: arr.map((v) => ({ value: String(v) })) } });
   const values = {};
   if (d.enabled) Object.assign(values, { daily_time: time(d.time), daily_scope: { v: one(d.scope) }, daily_days: many(d.days), daily_empty: { v: one(d.empty) } });
-  if (r.enabled) Object.assign(values, { reminder_offset: { v: one(r.offset) }, reminder_allday_time: time(r.allDayTime), reminder_days: many(r.days) });
-  if (c.enabled) Object.assign(values, { changes_types: many(c.types), changes_wait: { v: one(c.wait) }, changes_past: { v: one(c.past ? 'on' : 'off') } });
+  if (r.enabled) Object.assign(values, { reminder_offset: { v: one(r.offset) }, reminder_days: many(r.days) }, r.allDay ? { reminder_allday_time: time(r.allDayTime) } : {});
+  if (c.enabled) Object.assign(values, { changes_days: many(c.days), changes_types: many(c.types), changes_wait: { v: one(c.wait) }, changes_past: { v: one(c.past ? 'on' : 'off') } }, c.hold ? { changes_hold_time: time(c.holdTime) } : {});
   const draft = {
     daily: { enabled: d.enabled, time: 540, scope: 'all', days: d.days, empty: 'skip' },
-    reminder: { enabled: r.enabled, offset: 15, allDayTime: 540, days: r.days },
-    changes: { enabled: c.enabled, types: [], wait: 1, past: false },
+    reminder: { enabled: r.enabled, offset: 15, allDay: r.allDay, allDayTime: 540, days: r.days },
+    changes: { enabled: c.enabled, types: [], wait: 1, past: false, days: c.days, hold: c.hold, holdTime: 540 },
   };
   return { values, draft };
 }
@@ -277,7 +283,7 @@ function blockAction(env, actionId, value, user = 'UA') {
     type: 'block_actions',
     user: { id: user },
     view: { id: 'V1', private_metadata: JSON.stringify({ channelId: 'C1' }) },
-    actions: [{ action_id: actionId, value }],
+    actions: [actionId === 'pick_tab' ? { action_id: actionId, selected_option: { value } } : { action_id: actionId, value }],
   });
 }
 
@@ -339,8 +345,8 @@ const tests = {
     env.command({ user_id: 'UA', channel_id: 'C1' });
     const [nonAdmin, admin] = env.calls('views.open').map((c) => c.params.view);
     assert.deepStrictEqual(actionIds(nonAdmin), []);
-    assert.ok(nonAdmin.blocks.some((b) => JSON.stringify(b).includes('관리자만')));
-    assert.deepStrictEqual(actionIds(admin).sort(), ['add_conn', 'change_calendar', 'edit_admins', 'edit_conn', 'test_conn', 'toggle_conn']);
+    assert.strictEqual(nonAdmin.blocks[1].text.text, '관리자: <@UA>', 'non-admins see who the admins are, without a button');
+    assert.deepStrictEqual(actionIds(admin).sort(), ['add_conn', 'change_calendar', 'conn_menu', 'edit_admins', 'edit_conn', 'test_conn', 'toggle_conn']);
   },
 
   'non-admin button clicks are ignored': () => {
@@ -392,13 +398,22 @@ const tests = {
 
     configure(env, { daily: { time: 18 * 60 + 10, empty: 'send' }, reminder: { enabled: true, offset: 0, allDayTime: 18 * 60 + 12, days: [1, 3, 4] } });
     env.command({ user_id: 'UA', channel_id: 'C1' });
-    const summary = env.calls('views.open').at(-1).params.view.blocks.find((b) => b.text && b.text.text.includes('[하루 요약]')).text.text;
-    assert.ok(summary.includes('• *[하루 요약]* 오후 6:10에 발송 | 모든 일정 | 평일 | 일정 없음 표시함'), summary);
-    assert.ok(summary.includes('• *[일정별 알림]* 시작 시간에 발송 | *[종일일정 알림]* 오후 6:12에 발송 | 월·수·목'), summary);
+    // The calendar name line, then its routine lines as small gray context text.
+    const summaryOf = () => {
+      const blocks = env.calls('views.open').at(-1).params.view.blocks;
+      const i = blocks.findIndex((b) => b.accessory && b.accessory.action_id === 'conn_menu');
+      assert.strictEqual(blocks[i + 1].type, 'context');
+      return `${blocks[i].text.text}\n${blocks[i + 1].elements[0].text}`;
+    };
+    const summary = summaryOf();
+    assert.strictEqual(summary, [
+      '*<https://calendar.google.com/calendar/embed?src=cal1&ctz=Asia%2FSeoul|디자인팀>*',
+      '📅 하루 요약 (월-금)  |  오후 6:10  |  모든 일정  |  일정없음 알림 O',
+      '🔔 일정 알림 (월, 수, 목)  |  일정 시작 시간에  |  종일 일정 알림 O (오후 6:12)',
+    ].join('\n'));
     configure(env, { reminder: { enabled: false } });
     env.command({ user_id: 'UA', channel_id: 'C1' });
-    const offView = JSON.stringify(env.calls('views.open').at(-1).params.view);
-    assert.ok(offView.includes('[하루 요약]') && !offView.includes('[일정별 알림]'), 'a routine that is off has no summary line');
+    assert.ok(summaryOf().includes('📅') && !summaryOf().includes('🔔'), 'a routine that is off has no summary line');
   },
 
   'on/off buttons redraw the settings screen, keeping picked values, without saving': () => {
@@ -407,8 +422,9 @@ const tests = {
     blockAction(env, 'edit_conn', connId);
     let modal = env.calls('views.push').at(-1).params.view;
     assert.strictEqual(modal.blocks.find((b) => b.block_id === 'daily_enabled').accessory.text.text, '● 켜짐');
-    const tabs = () => modal.blocks.find((b) => b.block_id === 'tabs').elements.map((e) => `${e.text.text}${e.style ? '+' : ''}`);
-    assert.deepStrictEqual(tabs(), ['📅 하루 요약 | 켜짐+', '🔔 일정별 알림 | 꺼짐', '✏️ 변경 알림 | 꺼짐']);
+    // 알림 유형 dropdown: each option, with + on the one currently selected.
+    const tabs = () => { const sel = modal.blocks.find((b) => b.block_id === 'tabs').accessory; return sel.options.map((o) => `${o.text.text}${o.value === sel.initial_option.value ? '+' : ''}`); };
+    assert.deepStrictEqual(tabs(), ['📅 하루 요약  |  켜짐+', '🔔 일정 알림  |  꺼짐', '✏️ 변경 알림  |  꺼짐']);
     assert.ok(!modal.blocks.some((b) => b.block_id === 'reminder_enabled'), 'only the selected tab is shown');
     const days = modal.blocks.find((b) => b.block_id === 'daily_days');
     assert.strictEqual(days.element.type, 'multi_static_select');
@@ -418,17 +434,17 @@ const tests = {
 
     const picked = { daily_days: { v: { selected_options: [{ value: '2' }, { value: '6' }] } } };
     const press = (actionId, value, values = {}) => {
-      env.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values } }, actions: [{ action_id: actionId, value }] });
+      env.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values } }, actions: [actionId === 'pick_tab' ? { action_id: actionId, selected_option: { value } } : { action_id: actionId, value }] });
       modal = env.calls('views.update').at(-1).params.view;
     };
     const click = (routine, values) => press('toggle_routine', routine, values);
-    press('tab_reminder', 'reminder', picked);
-    assert.deepStrictEqual(tabs(), ['📅 하루 요약 | 켜짐', '🔔 일정별 알림 | 꺼짐+', '✏️ 변경 알림 | 꺼짐']);
+    press('pick_tab', 'reminder', picked);
+    assert.deepStrictEqual(tabs(), ['📅 하루 요약  |  켜짐', '🔔 일정 알림  |  꺼짐+', '✏️ 변경 알림  |  꺼짐']);
     assert.ok(!modal.blocks.some((b) => b.block_id === 'daily_days'));
     click('reminder');
     assert.ok(modal.blocks.some((b) => b.block_id === 'reminder_offset'));
     assert.strictEqual(modal.blocks.find((b) => b.block_id === 'reminder_enabled').accessory.text.text, '● 켜짐');
-    press('tab_daily', 'daily');
+    press('pick_tab', 'daily');
     assert.deepStrictEqual(modal.blocks.find((b) => b.block_id === 'daily_days').element.initial_options.map((o) => o.text.text), ['화', '토'], 'picks survive switching tabs');
     assert.deepStrictEqual(env.channel('C1').connections[0].daily.days, [1, 2, 3, 4, 5], 'nothing saved before 저장');
 
@@ -478,9 +494,9 @@ const tests = {
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1);
     const text = env.posts('C1')[0];
-    assert.strictEqual(text, ':bell: *일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 디자인 리뷰');
+    assert.strictEqual(text, '*일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 디자인 리뷰');
     const [attachment] = env.rawPosts('C1')[0].attachments;
-    assert.ok(attachment.pretext.startsWith(':bell:') && !attachment.text.includes('디자인팀'), 'calendar line sits outside the color bar');
+    assert.ok(attachment.pretext.startsWith('*일정 알림*') && !attachment.text.includes('디자인팀'), 'calendar line sits outside the color bar');
 
     event.start = kst('2026-11-09T10:40');
     event.end = kst('2026-11-09T11:10');
@@ -571,7 +587,7 @@ const tests = {
     timed.setNow('2026-11-09T09:00');
     timed.run('dispatchDue');
     const summary = timed.posts('C1')[0];
-    assert.strictEqual(summary, ':date: *오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건\n14:00 - 15:00 주간 회의');
+    assert.strictEqual(summary, '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건\n14:00 - 15:00 주간 회의');
     assert.strictEqual(timed.rawPosts('C1')[0].attachments[0].color, '#4285F4');
 
     const skip = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'skip' } });
@@ -582,7 +598,7 @@ const tests = {
     const send = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'send' } });
     send.setNow('2026-11-10T09:00');
     send.run('dispatchDue');
-    assert.strictEqual(send.posts('C1')[0], ':date: *오늘 요약* | 11월 10일 화요일 | 디자인팀 | 총 0건\n일정 없음');
+    assert.strictEqual(send.posts('C1')[0], '*오늘 요약* | 11월 10일 화요일 | 디자인팀 | 총 0건\n일정 없음');
   },
 
   'daily summaries for the same channel and time are grouped by calendar in one message': () => {
@@ -602,18 +618,18 @@ const tests = {
     // One attachment per event; the calendar header rides only on each calendar's first event, outside the bar.
     const attachments = env.rawPosts('C1')[0].attachments;
     assert.deepStrictEqual(attachments.map((a) => a.pretext || null), [
-      ':date: *오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', null, ':date: *오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건',
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', null, '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건',
     ]);
     assert.deepStrictEqual(attachments.map((a) => a.color), ['#4285F4', '#4285F4', '#E67C73']);
     assert.strictEqual(nine[0], [
-      ':date: *오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', '10:00 - 11:00 A 회의', '15:00 - 16:00 A 리뷰',
-      ':date: *오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건', '13:00 - 14:00 B 배포',
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', '10:00 - 11:00 A 회의', '15:00 - 16:00 A 리뷰',
+      '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건', '13:00 - 14:00 B 배포',
     ].join('\n'));
     env.setNow('2026-11-09T10:00');
     env.run('rebuildSchedule');
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 2);
-    assert.ok(env.posts('C1')[1].startsWith(':date: *오늘 요약* | 11월 9일 월요일 | 전사'));
+    assert.ok(env.posts('C1')[1].startsWith('*오늘 요약* | 11월 9일 월요일 | 전사'));
   },
 
   'event titles link to the event, using the occurrence id for recurring events': () => {
@@ -726,8 +742,8 @@ const tests = {
     const msgs = env.ephemerals('UA');
     assert.ok(!msgs.some((m) => m.includes('[테스트')), 'no test label');
     assert.ok(msgs[0] === '*디자인팀*, *11월 6일 (금)* 에 등록된 일정입니다.');
-    assert.ok(msgs.includes(':date: *하루 요약* | 11월 6일 금요일 | 디자인팀 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
-    assert.ok(msgs.includes(':bell: *일정 알림* | 디자인팀 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
+    assert.ok(msgs.includes('*하루 요약* | 11월 6일 금요일 | 디자인팀 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
+    assert.ok(msgs.includes('*일정 알림* | 디자인팀 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
     assert.ok(!msgs.join('\n').includes('목요일 회의') && !msgs.join('\n').includes('다음 회의'));
     assert.strictEqual(env.posts('C1').length, 0);
   },
@@ -740,9 +756,9 @@ const tests = {
 
     env.command({ user_id: 'UA', channel_id: 'C1' });
     const blocks = env.calls('views.open').at(-1).params.view.blocks;
-    assert.ok(blocks.some((b) => b.text && b.text.text.startsWith('*디자인팀* | :large_green_circle: 알림 중')));
+    assert.ok(blocks.some((b) => b.text && b.text.text.startsWith('*<https://calendar.google.com/calendar/embed?src=cal1&ctz=Asia%2FSeoul|디자인팀>*')));
     const row = blocks.find((b) => b.type === 'actions' && b.elements.some((e) => e.action_id === 'change_calendar'));
-    assert.deepStrictEqual(row.elements.map((e) => e.text.text), ['테스트 메시지 발송', '일시정지', '캘린더 변경', '⚙️ 설정']);
+    assert.deepStrictEqual(row.elements.map((e) => e.text.text), ['연결상태 테스트', '일시정지', '캘린더 바꾸기', '⚙️ 설정']);
     env.command({ user_id: 'UB', channel_id: 'C1' });
     assert.ok(!JSON.stringify(env.calls('views.open').at(-1).params.view).includes('change_calendar'), 'non-admins get no change button');
 
@@ -775,7 +791,7 @@ const tests = {
     const connId = env.channel('C1').connections[0].id;
     blockAction(env, 'edit_conn', connId);
     const modal = env.calls('views.push').at(-1).params.view;
-    assert.ok(modal.blocks[0].text.text.startsWith('*디자인팀* → <#C1>'));
+    assert.ok(modal.blocks[0].text.text === '*디자인팀* 일정을 <#C1>에 발송합니다.' && modal.blocks[0].accessory.text.text === '연결 끊기');
     const danger = modal.blocks[0].accessory;
     assert.deepStrictEqual([danger.action_id, danger.style, !!danger.confirm], ['delete_conn', 'danger', true]);
 
@@ -785,7 +801,7 @@ const tests = {
     assert.strictEqual(parent.view_id, 'V1');
     assert.strictEqual(parent.view.callback_id, 'channel');
     assert.strictEqual(self.view_id, 'V3');
-    assert.ok(JSON.stringify(self.view).includes('연결을 삭제했습니다'));
+    assert.ok(JSON.stringify(self.view).includes('연결을 끊었습니다'));
   },
 
   'change alerts wait for the last edit and send only the final content': () => {
@@ -802,7 +818,7 @@ const tests = {
     dispatchAt('2026-11-09T10:06');
     assert.strictEqual(env.posts('C1').length, 0, 'still waiting after the last edit');
     dispatchAt('2026-11-09T10:07');
-    assert.deepStrictEqual(env.posts('C1'), ['🆕 *일정 등록* | 디자인팀 | 총 1건\n11월 12일 (목) 14:00 - 15:00 주간 회의 (수정)\n3층']);
+    assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) 14:00 - 15:00 주간 회의 (수정)\n3층']);
     assert.ok(env.rawPosts('C1')[0].attachments[0].text.includes('<https://calendar.example/n1|'), 'title links to the event');
 
     env.setNow('2026-11-09T10:10');
@@ -814,17 +830,17 @@ const tests = {
 
     env.calendarEdit('cal1', 'old', { start: kst('2026-11-10T11:00'), end: kst('2026-11-10T12:00') });
     dispatchAt('2026-11-09T10:14');
-    assert.strictEqual(env.posts('C1')[1], '✏️ *일정 변경* | 디자인팀 | 총 1건\n11월 10일 (화) 11:00 - 12:00 기존 회의');
+    assert.strictEqual(env.posts('C1')[1], '*일정 변경* | 디자인팀\n11월 10일 (화) 11:00 - 12:00 기존 회의');
 
     env.calendarEdit('cal1', 'old', { deleted: true });
     dispatchAt('2026-11-09T10:16');
-    assert.strictEqual(env.posts('C1')[2], '🗑️ *일정 삭제* | 디자인팀 | 총 1건\n~11월 10일 (화) 11:00 - 12:00 기존 회의~');
+    assert.strictEqual(env.posts('C1')[2], '*일정 삭제* | 디자인팀\n~11월 10일 (화) 11:00 - 12:00 기존 회의~');
     assert.ok(!env.rawPosts('C1')[2].attachments[0].text.includes('<https'), 'deleted events have no link');
   },
 
   'change alert types and the past-event option filter what is sent': () => {
     const env = connectedEnv('2026-11-09T10:00', [ev('old', '기존 회의', '2026-11-10T10:00', '2026-11-10T11:00')]);
-    assert.deepStrictEqual(env.channel('C1').connections[0].changes, { enabled: false, types: [], wait: 1, past: false, since: 0 }, 'off by default');
+    assert.deepStrictEqual(env.channel('C1').connections[0].changes, { enabled: false, types: [], wait: 1, past: false, since: 0, days: [1, 2, 3, 4, 5], hold: false, holdTime: 540 }, 'off by default');
     configure(env, { changes: { enabled: true, types: ['created'], wait: 0 } });
     env.run('rebuildSchedule');
     env.clearCalls();
@@ -837,10 +853,10 @@ const tests = {
     configure(env, { changes: { enabled: true, types: ['created'], wait: 0, past: true } });
     env.calendarEdit('cal1', 'p2', { title: '지난 일정 등록', start: kst('2026-11-08T16:00'), end: kst('2026-11-08T17:00') });
     env.run('dispatchDue');
-    assert.deepStrictEqual(env.posts('C1'), ['🆕 *일정 등록* | 디자인팀 | 총 1건\n11월 8일 (일) 16:00 - 17:00 지난 일정 등록']);
+    assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 8일 (일) 16:00 - 17:00 지난 일정 등록']);
   },
 
-  'making an event private counts as deleted; a recurring series change is one alert marked (반복)': () => {
+  'making an event private counts as deleted; a recurring series change is one alert with its repeat rule': () => {
     const env = connectedEnv('2026-11-09T10:00', [
       ev('pub', '공개 회의', '2026-11-11T10:00', '2026-11-11T11:00'),
       ev('rec', '스탠드업', '2026-11-03T10:00', '2026-11-03T10:30', { recurring: true, next: [kst('2026-11-10T10:00'), kst('2026-11-10T10:30')] }),
@@ -853,8 +869,8 @@ const tests = {
     env.calendarEdit('cal1', 'rec', { title: '스탠드업 회의' });
     env.run('dispatchDue');
     const posts = env.posts('C1');
-    assert.ok(posts.includes('🗑️ *일정 삭제* | 디자인팀 | 총 1건\n~11월 11일 (수) 10:00 - 11:00 공개 회의~'), posts.join('\n---\n'));
-    assert.ok(posts.includes('✏️ *일정 변경* | 디자인팀 | 총 1건\n11월 10일 (화) 10:00 - 10:30 스탠드업 회의 (반복)'), posts.join('\n---\n'));
+    assert.ok(posts.includes('*일정 삭제* | 디자인팀\n~11월 11일 (수) 10:00 - 11:00 공개 회의~'), posts.join('\n---\n'));
+    assert.ok(posts.includes('*일정 변경* | 디자인팀\n11월 10일 (화) 10:00 - 10:30 스탠드업 회의\n매주 화요일'), posts.join('\n---\n'));
   },
 
   'an expired sync token re-reads the calendar and still reports changes since the last check': () => {
@@ -876,14 +892,19 @@ const tests = {
     blockAction(env, 'edit_conn', env.channel('C1').connections[0].id);
     let modal = env.calls('views.push').at(-1).params.view;
     const press = (actionId, value) => {
-      env.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values: {} } }, actions: [{ action_id: actionId, value }] });
+      env.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values: {} } }, actions: [actionId === 'pick_tab' ? { action_id: actionId, selected_option: { value } } : { action_id: actionId, value }] });
       modal = env.calls('views.update').at(-1).params.view;
     };
-    press('tab_changes', 'changes');
+    press('pick_tab', 'changes');
     assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_enabled').accessory.text.text, '○ 꺼짐');
     press('toggle_routine', 'changes');
-    assert.ok(['changes_types', 'changes_wait', 'changes_past'].every((id) => modal.blocks.some((b) => b.block_id === id)));
+    const order = modal.blocks.map((b) => b.block_id).filter((id) => /^changes_/.test(id || ''));
+    assert.deepStrictEqual(order, ['changes_enabled', 'changes_days', 'changes_types', 'changes_wait', 'changes_past', 'changes_hold_enabled']);
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_past').label.text, '과거 일정에 대한 변경 알림');
     assert.ok(JSON.stringify(modal.blocks).includes('알림 종류를 하나 이상'), 'no type picked yet');
+    press('toggle_routine', 'hold');
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_hold_enabled').accessory.text.text, '● 켜짐');
+    assert.ok(modal.blocks.some((b) => b.block_id === 'changes_hold_time'), 'turning it on shows the send time');
 
     const blocked = response(configure(env, { changes: { enabled: true, types: [] } }));
     assert.strictEqual(blocked.response_action, 'update');
@@ -894,7 +915,7 @@ const tests = {
     assert.ok(conn.changes.since > 0);
     env.command({ user_id: 'UA', channel_id: 'C1' });
     const view = JSON.stringify(env.calls('views.open').at(-1).params.view);
-    assert.ok(view.includes('• *[변경 알림]* 등록·삭제 | 즉시 발송 | 지난 일정 알리지 않음'), view);
+    assert.ok(view.includes('✏️ 변경 알림 (매일)  |  등록, 삭제만  |  즉시 알림  |  과거 일정 변경 알림 X  |  설정요일 외 변경 재알림 X'), view);
   },
 
   'without the Calendar API service, change alerts DM the app admin once': () => {
@@ -907,6 +928,171 @@ const tests = {
     const dms = env.posts('UA');
     assert.strictEqual(dms.length, 1);
     assert.ok(dms[0].includes('Google Calendar API'));
+  },
+
+  'the ⋯ menu disconnects after confirming; paused status and the change log show in the channel settings': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    const connId = env.channel('C1').connections[0].id;
+    blockAction(env, 'toggle_conn', connId);
+    env.command({ user_id: 'UA', channel_id: 'C1' });
+    let view = env.calls('views.open').at(-1).params.view;
+    assert.deepStrictEqual([view.title.text, view.submit, view.close.text, view.blocks[0].text.text, view.blocks[0].accessory.text.text], ['Checky Bot 설정', undefined, '닫기', '현재 채널: <#C1>', '캘린더 추가']);
+    assert.deepStrictEqual([view.blocks[1].text.text, view.blocks[1].accessory.action_id, view.blocks[1].accessory.text.text], ['관리자: <@UA>', 'edit_admins', '관리자 변경']);
+    const row = view.blocks.find((b) => b.accessory && b.accessory.action_id === 'conn_menu');
+    const details = view.blocks[view.blocks.indexOf(row) + 1];
+    assert.strictEqual(details.type, 'context', 'routine and status lines are small gray text');
+    assert.strictEqual(details.elements[0].text, '~📅 하루 요약 (월-금)  |  오전 9:00  |  모든 일정  |  일정없음 알림 X~\n⏸️ 일시정지 중');
+    assert.deepStrictEqual(row.accessory.options.map((o) => o.text.text), ['⚙️ 설정', '구글 캘린더 열기', '연결 끊기']);
+    const restart = view.blocks.find((b) => b.type === 'actions').elements.find((e) => e.action_id === 'toggle_conn');
+    assert.deepStrictEqual([restart.text.text, restart.style], ['다시 시작', 'primary']);
+    // Change log entries are small gray context text.
+    const log = view.blocks.filter((b) => b.type === 'context' && /\n<@UA>  \|  2026\/11\/09 오전 10:00$/.test(b.elements[0].text)).map((b) => b.elements[0].text.split('\n')[0]);
+    assert.deepStrictEqual(log.slice(0, 2), ['*디자인팀  |  일시정지*', '*디자인팀  |  새 캘린더 추가*']);
+
+    const menu = (option) => env.interact({ type: 'block_actions', user: { id: 'UA' }, trigger_id: 'TRIG', view: { id: 'V1', private_metadata: JSON.stringify({ channelId: 'C1' }) }, actions: [{ action_id: 'conn_menu', selected_option: { value: `${option}|${connId}` } }] });
+    menu('open');
+    assert.strictEqual(env.calls('views.push').length, 0, 'opening Google Calendar is a plain link');
+    menu('settings');
+    assert.strictEqual(env.calls('views.push').at(-1).params.view.callback_id, 'conn_settings', '⚙️ 설정 opens the alert settings');
+    menu('delete');
+    const confirm = env.calls('views.push').at(-1).params.view;
+    assert.strictEqual(confirm.callback_id, 'disconnect');
+    assert.strictEqual(env.channel('C1').connections.length, 1, 'nothing is removed before confirming');
+    const submit = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'V5', callback_id: 'disconnect', private_metadata: confirm.private_metadata, state: { values: {} } } });
+    assert.strictEqual(response(submit('UB')).response_action, 'update', 'non-admins cannot disconnect');
+    assert.strictEqual(submit('UA').content, '');
+    assert.strictEqual(env.channel('C1').connections.length, 0);
+    assert.strictEqual(env.channel('C1').log[0].text, '연결 끊기: 디자인팀');
+    assert.strictEqual(env.calls('views.update').at(-1).params.view_id, 'V1');
+  },
+
+  'all-day events get reminders only when 종일 일정 알림 is on': () => {
+    const event = allDay('w', '워크숍', '2026-11-10', '2026-11-11');
+    const off = connectedEnv('2026-11-10T08:50', [event], { daily: { enabled: false }, reminder: { enabled: true, allDay: false } });
+    off.setNow('2026-11-10T09:00');
+    off.run('dispatchDue');
+    assert.strictEqual(off.posts('C1').length, 0);
+    off.command({ user_id: 'UA', channel_id: 'C1' });
+    assert.ok(JSON.stringify(off.calls('views.open').at(-1).params.view).includes('🔔 일정 알림 (월-금)  |  일정 15분 전에  |  종일 일정 알림 X'));
+
+    const fresh = createEnv('2026-11-10T08:50');
+    fresh.addCalendar('cal1', '디자인팀', []);
+    fresh.run('setup');
+    fresh.event({ type: 'member_joined_channel', user: 'UBOT', channel: 'C1', inviter: 'UA' });
+    addConnection(fresh, 'cal1');
+    assert.strictEqual(fresh.channel('C1').connections[0].reminder.allDay, false, 'off by default for new connections');
+
+    // A connection saved before the switch existed keeps getting all-day reminders.
+    const ch = JSON.parse(fresh.state.props.CH_C1);
+    delete ch.connections[0].reminder.allDay;
+    ch.connections[0].reminder.enabled = true;
+    fresh.state.props.CH_C1 = JSON.stringify(ch);
+    fresh.state.calendars.cal1.events.push(event);
+    fresh.setNow('2026-11-10T09:00');
+    fresh.run('rebuildSchedule');
+    fresh.run('dispatchDue');
+    assert.strictEqual(fresh.posts('C1').filter((p) => p.startsWith('*일정 알림*')).length, 1, 'besides the 09:00 daily summary');
+
+    blockAction(fresh, 'edit_conn', ch.connections[0].id);
+    let modal = fresh.calls('views.push').at(-1).params.view;
+    fresh.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values: {} } }, actions: [{ action_id: 'pick_tab', selected_option: { value: 'reminder' } }] });
+    modal = fresh.calls('views.update').at(-1).params.view;
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'reminder_allday_enabled').accessory.text.text, '● 켜짐');
+    fresh.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values: {} } }, actions: [{ action_id: 'toggle_routine', value: 'allday' }] });
+    modal = fresh.calls('views.update').at(-1).params.view;
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'reminder_allday_enabled').accessory.text.text, '○ 꺼짐');
+    assert.ok(!modal.blocks.some((b) => b.block_id === 'reminder_allday_time'), 'the time picker hides when off');
+  },
+
+  '/checky today shows all of today only to me (anyone); today-all posts it to the channel (admins)': () => {
+    const env = connectedEnv('2026-11-09T15:00', [
+      allDay('h', '창립기념일', '2026-11-09', '2026-11-10'),
+      ev('m', '주간 회의', '2026-11-09T10:00', '2026-11-09T11:00'),
+      ev('t', '내일 회의', '2026-11-10T10:00', '2026-11-10T11:00'),
+    ], { daily: { enabled: false }, reminder: { enabled: true } });
+    env.addCalendar('cal2', '개발팀', []);
+    addConnection(env, 'cal2');
+    env.clearCalls();
+    const expected = '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n종일 창립기념일\n10:00 - 11:00 주간 회의\n*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건\n일정 없음';
+
+    assert.strictEqual(env.command({ user_id: 'UB', channel_id: 'C1', text: 'today' }).content, '');
+    assert.deepStrictEqual(env.ephemerals('UB'), [expected], 'whole day regardless of daily summary settings; empty calendars say 일정 없음');
+    assert.strictEqual(env.posts('C1').length, 0);
+
+    assert.ok(response(env.command({ user_id: 'UB', channel_id: 'C1', text: 'today-all' })).text.includes('관리자만'));
+    assert.strictEqual(env.posts('C1').length, 0);
+    env.command({ user_id: 'UA', channel_id: 'C1', text: 'today-all' });
+    const confirm = env.calls('views.open').at(-1).params.view;
+    assert.deepStrictEqual([confirm.callback_id, confirm.submit.text, confirm.blocks[0].text.text], ['today_all', '발송', '<#C1>에 오늘의 전체 일정을 발송하시겠습니까?']);
+    assert.strictEqual(env.posts('C1').length, 0, 'nothing is posted before confirming');
+    const submit = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'V6', callback_id: 'today_all', private_metadata: confirm.private_metadata, state: { values: {} } } });
+    assert.strictEqual(response(submit('UB')).response_action, 'update', 'non-admins cannot confirm');
+    assert.strictEqual(submit('UA').content, '');
+    assert.deepStrictEqual(env.posts('C1'), [expected]);
+    assert.strictEqual(env.channel('C1').log[0].text, '오늘 일정 채널에 발송');
+
+    assert.ok(response(env.command({ user_id: 'UA', channel_id: 'C9', text: 'today' })).text.includes('연결된 캘린더가 없습니다'));
+  },
+
+  'change alerts on unchosen weekdays are dropped, or held for the next chosen day when 쌓인 알림 is on': () => {
+    // 2026-11-07 is a Saturday; weekdays only.
+    const setup = (hold) => {
+      const env = connectedEnv('2026-11-07T10:00', []);
+      configure(env, { changes: { enabled: true, types: ['created'], wait: 0, days: [1, 2, 3, 4, 5], hold, holdTime: 9 * 60 } });
+      env.run('rebuildSchedule');
+      env.clearCalls();
+      env.calendarEdit('cal1', 'n1', { title: '주말에 등록', start: kst('2026-11-12T14:00'), end: kst('2026-11-12T15:00') });
+      env.run('dispatchDue');
+      return env;
+    };
+
+    const dropped = setup(false);
+    dropped.setNow('2026-11-09T09:00');
+    dropped.run('dispatchDue');
+    assert.strictEqual(dropped.posts('C1').length, 0, 'off: alerts from Saturday are not sent');
+
+    const held = setup(true);
+    assert.strictEqual(held.posts('C1').length, 0, 'nothing on Saturday');
+    held.setNow('2026-11-08T12:00'); // Sunday: another change joins the held alert
+    held.calendarEdit('cal1', 'n2', { title: '일요일에 등록', start: kst('2026-11-13T14:00'), end: kst('2026-11-13T15:00') });
+    held.run('dispatchDue');
+    held.setNow('2026-11-09T08:59');
+    held.run('dispatchDue');
+    assert.strictEqual(held.posts('C1').length, 0, 'held until 09:00 Monday');
+    held.setNow('2026-11-09T09:00');
+    held.run('dispatchDue');
+    assert.deepStrictEqual(held.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) 14:00 - 15:00 주말에 등록', '*일정 등록* | 디자인팀\n11월 13일 (금) 14:00 - 15:00 일요일에 등록'], 'one message per event');
+
+    held.command({ user_id: 'UA', channel_id: 'C1' });
+    assert.ok(JSON.stringify(held.calls('views.open').at(-1).params.view).includes('✏️ 변경 알림 (월-금)  |  등록만  |  즉시 알림  |  과거 일정 변경 알림 X  |  설정요일 외 변경 재알림 O (오전 9:00)'));
+  },
+
+  'repeat rules read like Google Calendar, in the small gray line under the event': () => {
+    const env = createEnv('2026-11-09T10:00');
+    const say = (rule, startIso = '2026-11-10T10:00') => env.sandbox.describeRecurrence_([`RRULE:${rule}`], kst(startIso));
+    assert.strictEqual(say('FREQ=DAILY'), '매일');
+    assert.strictEqual(say('FREQ=DAILY;INTERVAL=2'), '2일마다');
+    assert.strictEqual(say('FREQ=WEEKLY;BYDAY=TU;COUNT=13'), '매주 화요일, 13회');
+    assert.strictEqual(say('FREQ=WEEKLY;BYDAY=MO,WE,FR'), '매주 월요일, 수요일, 금요일');
+    assert.strictEqual(say('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR'), '매주 월-금');
+    assert.strictEqual(say('FREQ=WEEKLY;INTERVAL=2'), '2주마다 화요일', 'no BYDAY: the day of the event');
+    assert.strictEqual(say('FREQ=MONTHLY;BYMONTHDAY=15'), '매월 15일');
+    assert.strictEqual(say('FREQ=MONTHLY;BYDAY=2TU'), '매월 둘째 화요일');
+    assert.strictEqual(say('FREQ=MONTHLY;BYDAY=-1FR;UNTIL=20261231T145959Z'), '매월 마지막 금요일, 2026년 12월 31일까지');
+    assert.strictEqual(say('FREQ=YEARLY', '2026-11-09T10:00'), '매년 11월 9일');
+    assert.strictEqual(say('FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2'), '반복 일정', 'rules it cannot phrase');
+
+    const daily = connectedEnv('2026-11-10T08:50', [
+      ev('s', '스탠드업', '2026-11-10T09:30', '2026-11-10T10:00', { recurring: true, rrule: 'RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=13', desc: '3층' }),
+    ], { daily: { time: 540 } });
+    daily.setNow('2026-11-10T09:00');
+    daily.run('dispatchDue');
+    const [att] = daily.rawPosts('C1')[0].attachments;
+    assert.strictEqual(att.footer, '매주 화요일, 13회\n3층', 'repeat rule first, then the description');
+    const reads = () => daily.state.apiCalls.filter((c) => c.get).length;
+    const before = reads();
+    daily.run('rebuildSchedule');
+    assert.strictEqual(reads(), before, 'the rule is cached instead of read again');
   },
 
   'admin changes reject guests and an empty list': () => {
