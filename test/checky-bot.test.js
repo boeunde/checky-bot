@@ -915,7 +915,7 @@ const tests = {
     assert.ok(conn.changes.since > 0);
     env.command({ user_id: 'UA', channel_id: 'C1' });
     const view = JSON.stringify(env.calls('views.open').at(-1).params.view);
-    assert.ok(view.includes('✏️ 변경 알림 (매일)  |  등록, 삭제만  |  즉시 알림  |  과거 일정 변경 알림 X  |  설정요일 외 변경 재알림 X'), view);
+    assert.ok(view.includes('✏️ 변경 알림 (매일)  |  등록, 삭제만  |  즉시 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 X'), view);
   },
 
   'without the Calendar API service, change alerts DM the app admin once': () => {
@@ -1064,7 +1064,7 @@ const tests = {
     assert.deepStrictEqual(held.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) 14:00 - 15:00 주말에 등록', '*일정 등록* | 디자인팀\n11월 13일 (금) 14:00 - 15:00 일요일에 등록'], 'one message per event');
 
     held.command({ user_id: 'UA', channel_id: 'C1' });
-    assert.ok(JSON.stringify(held.calls('views.open').at(-1).params.view).includes('✏️ 변경 알림 (월-금)  |  등록만  |  즉시 알림  |  과거 일정 변경 알림 X  |  설정요일 외 변경 재알림 O (오전 9:00)'));
+    assert.ok(JSON.stringify(held.calls('views.open').at(-1).params.view).includes('✏️ 변경 알림 (월-금)  |  등록만  |  즉시 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 O (오전 9:00)'));
   },
 
   'repeat rules read like Google Calendar, in the small gray line under the event': () => {

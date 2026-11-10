@@ -1082,7 +1082,7 @@ function editDraft_(payload, ch, chId, action) {
   if (action.action_id === 'toggle_routine' && name === 'allday') {
     draft.reminder.allDay = !draft.reminder.allDay; // 일정 알림 안의 "종일 일정 알림"
   } else if (action.action_id === 'toggle_routine' && name === 'hold') {
-    draft.changes.hold = !draft.changes.hold; // 변경 알림 안의 "고르지 않은 요일의 알림"
+    draft.changes.hold = !draft.changes.hold; // 변경 알림 안의 "미설정요일 알림 모아보내기"
   } else {
     if (!draft[name]) return;
     if (action.action_id === 'toggle_routine') draft[name].enabled = !draft[name].enabled;
@@ -2029,12 +2029,12 @@ function describeReminder_(r) {
   return [`🔔 일정 알림 (${describeDays_(r.days)})`, when, allDay].join(SEP);
 }
 
-/** "✏️ 변경 알림 (월-금)  |  등록, 삭제만  |  1분 대기 후 알림  |  과거 일정 변경 알림 X  |  설정요일 외 변경 재알림 O (오전 9:00)" */
+/** "✏️ 변경 알림 (월-금)  |  등록, 삭제만  |  1분 대기 후 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 O (오전 9:00)" */
 function describeChanges_(c) {
   if (!c.enabled) return null;
   const picked = Object.keys(CHANGE_KINDS).filter((k) => c.types.includes(k)).map((k) => CHANGE_KINDS[k]);
   const types = picked.length === Object.keys(CHANGE_KINDS).length ? picked.join(', ') : `${picked.join(', ')}만`;
-  const held = c.hold ? `설정요일 외 변경 재알림 O (${formatAmPm_(c.holdTime)})` : '설정요일 외 변경 재알림 X';
+  const held = c.hold ? `미설정요일 알림 모아보내기 O (${formatAmPm_(c.holdTime)})` : '미설정요일 알림 모아보내기 X';
   return [`✏️ 변경 알림 (${describeDays_(c.days)})`, types, `${changeWaitLabel_(c.wait)} 알림`, `과거 일정 변경 알림 ${c.past ? 'O' : 'X'}`, held].join(SEP);
 }
 
@@ -2256,14 +2256,14 @@ function connModal_(chId, conn, parentViewId, draft) {
       if (picked.length) kindPicker.initial_options = picked;
       const waits = CHANGE_WAITS.map((w) => option_(changeWaitLabel_(w), w));
       const pasts = [option_('알리지 않음', 'off'), option_('알림', 'on')];
-      // 요약 줄과 같은 순서: 요일 → 알림 종류 → 발송 시점 → 과거 일정 → 고르지 않은 요일의 알림
+      // 요약 줄과 같은 순서: 요일 → 알림 종류 → 발송 시점 → 과거 일정 → 미설정요일 알림 모아보내기
       blocks.push(
         dayPicker_('changes', c.days),
         input_('changes_types', '알림 종류', kindPicker),
         input_('changes_wait', '발송 시점', select_(waits, c.wait)),
         input_('changes_past', '과거 일정에 대한 변경 알림', { type: 'radio_buttons', options: pasts, initial_option: findOption_(pasts, c.past ? 'on' : 'off') }),
       );
-      const hold = section_('*고르지 않은 요일의 알림*\n고르지 않은 요일에 생긴 변경을 모아 두었다가 돌아오는 첫 요일에 보냅니다. 끄면 그 알림은 보내지 않습니다.');
+      const hold = section_('*미설정요일 알림 모아보내기*\n고르지 않은 요일에 생긴 변경을 모아 두었다가 돌아오는 첫 요일에 보냅니다. 끄면 그 알림은 보내지 않습니다.');
       hold.block_id = 'changes_hold_enabled';
       hold.accessory = Object.assign(button_(c.hold ? '● 켜짐' : '○ 꺼짐', 'toggle_routine', 'hold'), c.hold ? { style: 'primary' } : {});
       blocks.push(hold);
