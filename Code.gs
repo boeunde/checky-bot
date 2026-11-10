@@ -1,5 +1,5 @@
 /**
- * checky-bot v2
+ * checky-bot v1.0.0
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -75,7 +75,7 @@ function setup() {
   syncCalendarTriggers_();
   invalidateSchedule_();
   if (typeof Calendar === 'undefined') {
-    console.warn('변경 알림(2단계)을 쓰려면 편집기 왼쪽 서비스 + 에서 Google Calendar API를 추가하세요.');
+    console.warn('변경 알림(일정 등록·변경·삭제)을 쓰려면 편집기 왼쪽 서비스 + 에서 Google Calendar API를 추가하세요.');
   }
   console.log(`Slack 봇 ${auth.user}(으)로 연결되었습니다. 이제 웹 앱으로 배포하세요.`);
 }
@@ -1306,7 +1306,7 @@ function runTest_(chId, conn, userId) {
   if (messages.length > TEST_MESSAGE_LIMIT) say(`외 ${messages.length - TEST_MESSAGE_LIMIT}건은 생략했습니다.`);
 }
 
-// ─── 변경 알림 (2단계) ────────────────────────────────────
+// ─── 변경 알림 ───────────────────────────────────────────
 //
 // 1. 캘린더가 바뀌면(onCalendarChanged) 또는 10분마다, 변경 알림을 켠 캘린더를 Google Calendar API로
 //    "지난번 이후 바뀐 일정"만 받아 옵니다(syncToken). 고급 서비스 "Google Calendar API"가 필요합니다.
