@@ -8,6 +8,16 @@ const assert = require('assert');
 const CODE = fs.readFileSync(path.join(__dirname, '..', 'Code.gs'), 'utf8');
 const kst = (iso) => new Date(`${iso}:00+09:00`).getTime(); // 'YYYY-MM-DDTHH:mm' in Korea time
 
+/** Slack rejects a whole view when a button or option value is not a string (invalid_arguments). */
+function checkBlockKit(node, path = 'view') {
+  if (Array.isArray(node)) return node.forEach((n, i) => checkBlockKit(n, `${path}[${i}]`));
+  if (!node || typeof node !== 'object') return;
+  if ((node.type === 'button' || (node.text && 'value' in node && !node.type)) && 'value' in node) {
+    assert.strictEqual(typeof node.value, 'string', `${path}.value must be a string for Slack`);
+  }
+  Object.keys(node).forEach((k) => checkBlockKit(node[k], `${path}.${k}`));
+}
+
 function createEnv(nowIso) {
   const RealDate = Date;
   let now = kst(nowIso);
@@ -167,6 +177,7 @@ function createEnv(nowIso) {
         assert.strictEqual(opts.headers.Authorization, 'Bearer xoxb-test');
         const params = Object.assign({}, opts.payload);
         ['view', 'blocks', 'attachments'].forEach((k) => { if (params[k]) params[k] = JSON.parse(params[k]); });
+        if (params.view || params.blocks) checkBlockKit(params.view || params.blocks);
         const res = slack(url.slice('https://slack.com/api/'.length), params);
         return { getContentText: () => JSON.stringify(res), getResponseCode: () => 200 };
       }
@@ -230,7 +241,10 @@ const allDay = (id, title, startDate, endDateExclusive, extra = {}) => ev(id, ti
 function settingsForm({ daily = {}, reminder = {}, changes = {} } = {}) {
   const d = Object.assign({ enabled: true, time: 540, scope: 'all', days: [1, 2, 3, 4, 5], empty: 'skip' }, daily);
   const r = Object.assign({ enabled: false, offset: 15, allDay: true, allDayTime: 540, days: [1, 2, 3, 4, 5] }, reminder);
-  const c = Object.assign({ enabled: false, types: [], wait: 1, past: false, days: [0, 1, 2, 3, 4, 5, 6], hold: false, holdTime: 540 }, changes);
+  // changes: one set given flat ({ enabled, types, ... }) or several as { enabled, sets: [...] }.
+  const setDefaults = { types: [], wait: 1, past: false, days: [0, 1, 2, 3, 4, 5, 6], hold: false, holdTime: 540 };
+  const sets = (changes.sets || [changes]).map((s, i) => Object.assign({ id: i + 1 }, setDefaults, s));
+  const c = { enabled: !!changes.enabled };
   const one = (v) => ({ selected_option: { value: String(v) } });
   const pad = (n) => String(n).padStart(2, '0');
   const time = (m) => ({ v: { selected_time: `${pad(Math.floor(m / 60))}:${pad(m % 60)}` } });
@@ -238,11 +252,16 @@ function settingsForm({ daily = {}, reminder = {}, changes = {} } = {}) {
   const values = {};
   if (d.enabled) Object.assign(values, { daily_time: time(d.time), daily_scope: { v: one(d.scope) }, daily_days: many(d.days), daily_empty: { v: one(d.empty) } });
   if (r.enabled) Object.assign(values, { reminder_offset: { v: one(r.offset) }, reminder_days: many(r.days) }, r.allDay ? { reminder_allday_time: time(r.allDayTime) } : {});
-  if (c.enabled) Object.assign(values, { changes_days: many(c.days), changes_types: many(c.types), changes_wait: { v: one(c.wait) }, changes_past: { v: one(c.past ? 'on' : 'off') } }, c.hold ? { changes_hold_time: time(c.holdTime) } : {});
+  if (c.enabled) {
+    sets.forEach((s) => {
+      const p = `changes_${s.id}`;
+      Object.assign(values, { [`${p}_days`]: many(s.days), [`${p}_types`]: many(s.types), [`${p}_wait`]: { v: one(s.wait) }, [`${p}_past`]: { v: one(s.past ? 'on' : 'off') } }, s.hold ? { [`${p}_hold_time`]: time(s.holdTime) } : {});
+    });
+  }
   const draft = {
     daily: { enabled: d.enabled, time: 540, scope: 'all', days: d.days, empty: 'skip' },
     reminder: { enabled: r.enabled, offset: 15, allDay: r.allDay, allDayTime: 540, days: r.days },
-    changes: { enabled: c.enabled, types: [], wait: 1, past: false, days: c.days, hold: c.hold, holdTime: 540 },
+    changes: { enabled: c.enabled, since: 0, sets: sets.map((s) => ({ id: s.id, types: [], wait: 1, past: false, days: s.days, hold: s.hold, holdTime: 540 })) },
   };
   return { values, draft };
 }
@@ -840,7 +859,7 @@ const tests = {
 
   'change alert types and the past-event option filter what is sent': () => {
     const env = connectedEnv('2026-11-09T10:00', [ev('old', '기존 회의', '2026-11-10T10:00', '2026-11-10T11:00')]);
-    assert.deepStrictEqual(env.channel('C1').connections[0].changes, { enabled: false, types: [], wait: 1, past: false, since: 0, days: [1, 2, 3, 4, 5], hold: false, holdTime: 540 }, 'off by default');
+    assert.deepStrictEqual(env.channel('C1').connections[0].changes, { enabled: false, since: 0, sets: [{ id: 1, types: [], wait: 1, past: false, days: [1, 2, 3, 4, 5], hold: false, holdTime: 540 }] }, 'off by default');
     configure(env, { changes: { enabled: true, types: ['created'], wait: 0 } });
     env.run('rebuildSchedule');
     env.clearCalls();
@@ -899,12 +918,14 @@ const tests = {
     assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_enabled').accessory.text.text, '○ 꺼짐');
     press('toggle_routine', 'changes');
     const order = modal.blocks.map((b) => b.block_id).filter((id) => /^changes_/.test(id || ''));
-    assert.deepStrictEqual(order, ['changes_enabled', 'changes_days', 'changes_types', 'changes_wait', 'changes_past', 'changes_hold_enabled']);
-    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_past').label.text, '과거 일정에 대한 변경 알림');
+    assert.deepStrictEqual(order, ['changes_enabled', 'changes_1_set', 'changes_1_days', 'changes_1_types', 'changes_1_wait', 'changes_1_past', 'changes_1_hold_enabled', 'changes_add_set']);
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_1_set').text.text, '*세트 1*');
+    assert.ok(!modal.blocks.find((b) => b.block_id === 'changes_1_set').accessory, 'set 1 cannot be removed');
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_1_past').label.text, '과거 일정에 대한 변경 알림');
     assert.ok(JSON.stringify(modal.blocks).includes('알림 종류를 하나 이상'), 'no type picked yet');
-    press('toggle_routine', 'hold');
-    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_hold_enabled').accessory.text.text, '● 켜짐');
-    assert.ok(modal.blocks.some((b) => b.block_id === 'changes_hold_time'), 'turning it on shows the send time');
+    press('toggle_routine', 'hold:1');
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_1_hold_enabled').accessory.text.text, '● 켜짐');
+    assert.ok(modal.blocks.some((b) => b.block_id === 'changes_1_hold_time'), 'turning it on shows the send time');
 
     const blocked = response(configure(env, { changes: { enabled: true, types: [] } }));
     assert.strictEqual(blocked.response_action, 'update');
@@ -1065,6 +1086,65 @@ const tests = {
 
     held.command({ user_id: 'UA', channel_id: 'C1' });
     assert.ok(JSON.stringify(held.calls('views.open').at(-1).params.view).includes('✏️ 변경 알림 (월-금)  |  등록만  |  즉시 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 O (오전 9:00)'));
+  },
+
+  'change alert sets: add and remove sets, one set per type, each set with its own weekdays': () => {
+    const env = connectedEnv('2026-11-09T10:00', [ev('old', '기존 회의', '2026-11-16T10:00', '2026-11-16T11:00'), ev('old2', '다른 회의', '2026-11-17T10:00', '2026-11-17T11:00')]);
+    blockAction(env, 'edit_conn', env.channel('C1').connections[0].id);
+    let modal = env.calls('views.push').at(-1).params.view;
+    const press = (actionId, value, values = {}) => {
+      env.interact({ type: 'block_actions', user: { id: 'UA' }, view: { id: 'V3', private_metadata: modal.private_metadata, state: { values } }, actions: [actionId === 'pick_tab' ? { action_id: actionId, selected_option: { value } } : { action_id: actionId, value }] });
+      modal = env.calls('views.update').at(-1).params.view;
+    };
+    const ids = () => modal.blocks.map((b) => b.block_id).filter((id) => /^changes_\d+_set$|^changes_add_set$/.test(id || ''));
+    press('pick_tab', 'changes');
+    press('toggle_routine', 'changes');
+    // Set 1 picks 등록·변경, then [+ 세트 추가] starts set 2 with the type left over (삭제).
+    press('add_change_set', 'add', { changes_1_types: { v: { selected_options: [{ value: 'created' }, { value: 'updated' }] } } });
+    assert.deepStrictEqual(ids(), ['changes_1_set', 'changes_2_set', 'changes_add_set']);
+    const set2 = modal.blocks.find((b) => b.block_id === 'changes_2_set');
+    assert.strictEqual(set2.text.text, '*세트 2*');
+    assert.strictEqual(set2.accessory.action_id, 'remove_change_set', 'set 2 has a remove button');
+    assert.deepStrictEqual(modal.blocks.find((b) => b.block_id === 'changes_2_types').element.initial_options.map((o) => o.value), ['deleted']);
+    press('add_change_set', 'add');
+    assert.deepStrictEqual(ids(), ['changes_1_set', 'changes_2_set', 'changes_3_set'], 'at most 3 sets: no add button');
+    press('remove_change_set', '2');
+    assert.deepStrictEqual(ids(), ['changes_1_set', 'changes_3_set', 'changes_add_set'], 'ids stay put after removing a set');
+    assert.strictEqual(modal.blocks.find((b) => b.block_id === 'changes_3_set').text.text, '*세트 2*', 'shown by position');
+
+    // The same type in two sets cannot be saved.
+    const dup = response(configure(env, { changes: { enabled: true, sets: [{ types: ['created'] }, { types: ['created', 'deleted'] }] } }));
+    assert.strictEqual(dup.response_action, 'update');
+    assert.ok(JSON.stringify(dup.view.blocks).includes('등록을 여러 세트에서 골랐습니다'));
+    const conn0 = env.channel('C1').connections[0];
+    const onTab = env.sandbox.connModal_('C1', conn0, 'V1', { tab: 'changes', daily: conn0.daily, reminder: conn0.reminder, changes: { enabled: true, sets: [{ id: 1, types: ['deleted'] }, { id: 2, types: ['deleted'] }] } });
+    const at = onTab.blocks.findIndex((b) => b.block_id === 'changes_enabled');
+    assert.ok(onTab.blocks[at + 1].type === 'context' && JSON.stringify(onTab.blocks[at + 1]).includes('삭제를 여러 세트에서'), 'on the change alerts tab the warning sits right under the on/off button');
+    assert.strictEqual(onTab.blocks[at + 2].type, 'divider');
+    assert.strictEqual(env.channel('C1').connections[0].changes.enabled, false);
+
+    // Set 1: 월-금 등록·변경 즉시. Set 2: 금 삭제 즉시.
+    configure(env, { changes: { enabled: true, sets: [{ types: ['created', 'updated'], wait: 0, days: [1, 2, 3, 4, 5] }, { types: ['deleted'], wait: 0, days: [5] }] } });
+    assert.strictEqual(env.channel('C1').connections[0].changes.sets.length, 2);
+    env.run('rebuildSchedule');
+    env.clearCalls();
+    env.calendarEdit('cal1', 'old', { title: '기존 회의 (변경)' });
+    env.calendarEdit('cal1', 'old2', { deleted: true });
+    env.run('dispatchDue');
+    assert.deepStrictEqual(env.posts('C1'), ['*일정 변경* | 디자인팀\n11월 16일 (월) 10:00 - 11:00 기존 회의 (변경)'], 'Monday: the update is sent, the delete is not (set 2 is Friday only)');
+    env.setNow('2026-11-13T10:00'); // Friday
+    env.calendarEdit('cal1', 'old', { deleted: true });
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').at(-1), '*일정 삭제* | 디자인팀\n~11월 16일 (월) 10:00 - 11:00 기존 회의 (변경)~', 'Friday: deletes follow set 2');
+
+    env.command({ user_id: 'UA', channel_id: 'C1' });
+    const view = JSON.stringify(env.calls('views.open').at(-1).params.view);
+    assert.ok(view.includes('✏️ 변경 알림 (월-금)  |  등록, 변경만  |  즉시 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 X'), view);
+    assert.ok(view.includes('✏️ 변경 알림 (금)  |  삭제만  |  즉시 알림'), 'one summary line per set');
+
+    // Settings saved before sets existed become set 1.
+    const legacy = env.sandbox.normalizeChanges_({ enabled: true, types: ['created'], wait: 3, past: true, since: 5, hold: true, holdTime: 600 });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(legacy)), { enabled: true, since: 5, sets: [{ id: 1, types: ['created'], wait: 3, past: true, days: [0, 1, 2, 3, 4, 5, 6], hold: true, holdTime: 600 }] });
   },
 
   'repeat rules read like Google Calendar, in the small gray line under the event': () => {

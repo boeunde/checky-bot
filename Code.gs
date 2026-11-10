@@ -856,7 +856,7 @@ function handleBlockAction_(payload, userId) {
   if (!chId) return;
   const ch = loadChannel_(chId);
   if (!isAdmin_(ch, userId)) return; // 관리자가 아니면 무시합니다.
-  if (action.action_id === 'toggle_routine' || action.action_id === 'pick_tab') {
+  if (['toggle_routine', 'pick_tab', 'add_change_set', 'remove_change_set'].includes(action.action_id)) {
     editDraft_(payload, ch, chId, action);
     return;
   }
@@ -1035,7 +1035,7 @@ function submitChangeCalendar_(meta, ch, values, userId) {
 function draftFromView_(meta, values, conn) {
   const base = meta.draft || { daily: conn.daily, reminder: conn.reminder, changes: changesOf_(conn) };
   const draft = JSON.parse(JSON.stringify(base));
-  draft.changes = Object.assign(defaultChanges_(), draft.changes || {});
+  draft.changes = normalizeChanges_(draft.changes);
   const pick = (block) => {
     const b = values && values[block];
     return b && b.v && b.v.selected_option ? b.v.selected_option.value : null;
@@ -1046,27 +1046,42 @@ function draftFromView_(meta, values, conn) {
   const offset = pick('reminder_offset');
   if (offset !== null) draft.reminder.offset = Number(offset);
   draft.reminder.allDayTime = pickedTime_(values || {}, 'reminder_allday_time', draft.reminder.allDayTime);
-  draft.changes.holdTime = pickedTime_(values || {}, 'changes_hold_time', draft.changes.holdTime);
-  ['daily', 'reminder', 'changes'].forEach((name) => {
-    const b = values && values[`${name}_days`];
-    if (b && b.v) draft[name].days = WEEK_ORDER.filter((d) => (b.v.selected_options || []).some((o) => Number(o.value) === d));
+  const daysIn = (block, current) => {
+    const b = values && values[block];
+    return b && b.v ? WEEK_ORDER.filter((d) => (b.v.selected_options || []).some((o) => Number(o.value) === d)) : current;
+  };
+  draft.daily.days = daysIn('daily_days', draft.daily.days);
+  draft.reminder.days = daysIn('reminder_days', draft.reminder.days);
+  // 변경 알림 세트: 입력칸 이름은 changes_{세트 id}_...
+  draft.changes.sets.forEach((s) => {
+    const p = `changes_${s.id}`;
+    s.days = daysIn(`${p}_days`, s.days);
+    const types = values && values[`${p}_types`];
+    if (types && types.v) s.types = Object.keys(CHANGE_KINDS).filter((k) => (types.v.selected_options || []).some((o) => o.value === k));
+    const wait = pick(`${p}_wait`);
+    if (wait !== null) s.wait = Number(wait);
+    const past = pick(`${p}_past`);
+    if (past !== null) s.past = past === 'on';
+    s.holdTime = pickedTime_(values || {}, `${p}_hold_time`, s.holdTime);
   });
-  const types = values && values.changes_types;
-  if (types && types.v) draft.changes.types = Object.keys(CHANGE_KINDS).filter((k) => (types.v.selected_options || []).some((o) => o.value === k));
-  const wait = pick('changes_wait');
-  if (wait !== null) draft.changes.wait = Number(wait);
-  const past = pick('changes_past');
-  if (past !== null) draft.changes.past = past === 'on';
   return draft;
 }
 
+/** 저장을 막는 문제. 변경 알림의 값은 문제가 있는 세트 순서(1부터)나 겹친 종류 이름 목록입니다. */
 function draftProblems_(draft) {
   const problems = {};
   if (!draft.daily.enabled && !draft.reminder.enabled && !draft.changes.enabled) problems.none = true;
   if (draft.daily.enabled && !draft.daily.days.length) problems.daily = true;
   if (draft.reminder.enabled && !draft.reminder.days.length) problems.reminder = true;
-  if (draft.changes.enabled && !draft.changes.types.length) problems.changes = true;
-  if (draft.changes.enabled && !draft.changes.days.length) problems.changesDays = true;
+  if (draft.changes.enabled) {
+    const sets = draft.changes.sets;
+    const noTypes = sets.map((s, i) => (s.types.length ? 0 : i + 1)).filter(Boolean);
+    const noDays = sets.map((s, i) => (s.days.length ? 0 : i + 1)).filter(Boolean);
+    const dup = Object.keys(CHANGE_KINDS).filter((k) => sets.filter((s) => s.types.includes(k)).length > 1).map((k) => CHANGE_KINDS[k]);
+    if (noTypes.length) problems.changes = noTypes;
+    if (noDays.length) problems.changesDays = noDays;
+    if (dup.length) problems.changesDup = dup;
+  }
   return problems;
 }
 
@@ -1081,8 +1096,19 @@ function editDraft_(payload, ch, chId, action) {
   const name = action.action_id === 'pick_tab' ? action.selected_option && action.selected_option.value : action.value;
   if (action.action_id === 'toggle_routine' && name === 'allday') {
     draft.reminder.allDay = !draft.reminder.allDay; // 일정 알림 안의 "종일 일정 알림"
-  } else if (action.action_id === 'toggle_routine' && name === 'hold') {
-    draft.changes.hold = !draft.changes.hold; // 변경 알림 안의 "미설정요일 알림 모아보내기"
+  } else if (action.action_id === 'toggle_routine' && /^hold:/.test(name)) {
+    // 변경 알림 세트 안의 "미설정요일 알림 모아보내기"
+    const set = draft.changes.sets.find((s) => String(s.id) === name.slice(5));
+    if (set) set.hold = !set.hold;
+  } else if (action.action_id === 'add_change_set') {
+    // 새 세트는 아직 어느 세트에도 없는 종류를 골라 둔 채로 추가합니다.
+    const sets = draft.changes.sets;
+    if (sets.length >= Object.keys(CHANGE_KINDS).length) return;
+    const set = defaultChangeSet_(Math.max(...sets.map((s) => s.id)) + 1);
+    set.types = Object.keys(CHANGE_KINDS).filter((k) => !sets.some((s) => s.types.includes(k)));
+    sets.push(set);
+  } else if (action.action_id === 'remove_change_set') {
+    draft.changes.sets = draft.changes.sets.filter((s, i) => i === 0 || String(s.id) !== String(action.value));
   } else {
     if (!draft[name]) return;
     if (action.action_id === 'toggle_routine') draft[name].enabled = !draft[name].enabled;
@@ -1110,7 +1136,15 @@ function submitConnSettings_(meta, ch, values, userId) {
     target.reminder = reminder;
     // 변경 알림을 새로 켜면 그 시점의 일정을 기준으로 삼아, 그 뒤의 변경부터 알립니다.
     const wasOn = changesOf_(target).enabled;
-    target.changes = { enabled: changes.enabled, types: changes.types, wait: changes.wait, past: changes.past, days: changes.days, hold: changes.hold, holdTime: changes.holdTime, since: changes.enabled && !wasOn ? Date.now() : changesOf_(target).since };
+    target.changes = {
+      enabled: changes.enabled,
+      since: changes.enabled && !wasOn ? Date.now() : changesOf_(target).since,
+      sets: changes.sets.map((s) => {
+        const set = { id: s.id };
+        CHANGE_SET_KEYS.forEach((k) => (set[k] = s[k]));
+        return set;
+      }),
+    };
     target.updatedAt = Date.now();
     addLog_(c, userId, `알림 설정 변경: ${escapeSlack_(target.calendarName)}`);
     return true;
@@ -1286,26 +1320,59 @@ const SNAPSHOT_KEEP = 30 * DAY; // 이보다 오래 지난 일정의 요약은 �
 const CHUNK_SIZE = 2500; // 스크립트 속성 한 칸(9KB)에 한글이 들어가도 넘지 않는 글자 수
 
 /**
- * days: 변경 알림을 보내는 요일(보내는 날 기준).
- * hold: 고르지 않은 요일에 생긴 알림을 모아 두었다가 돌아오는 첫 요일의 holdTime에 보낼지. 끄면 그 알림은 보내지 않습니다.
+ * 변경 알림은 세트 목록(sets)입니다. 기본은 세트 1개이고, [+ 세트 추가]로 최대 3개까지 늘립니다.
+ * 알림 종류(등록·변경·삭제)마다 한 세트에만 넣을 수 있어, 알림 하나는 많아야 한 세트의 설정을 따릅니다.
+ * 세트의 값:
+ *   id: 세트를 지워도 바뀌지 않는 번호(화면 입력칸 이름에 씁니다). 화면의 "세트 N"은 순서입니다.
+ *   days: 변경 알림을 보내는 요일(보내는 날 기준).
+ *   hold: 고르지 않은 요일에 생긴 알림을 모아 두었다가 돌아오는 첫 요일의 holdTime에 보낼지. 끄면 그 알림은 보내지 않습니다.
  */
-function defaultChanges_() {
-  return { enabled: false, types: [], wait: 1, past: false, since: 0, days: WEEKDAYS.slice(), hold: false, holdTime: 9 * 60 };
+function defaultChangeSet_(id) {
+  return { id: id || 1, types: [], wait: 1, past: false, days: WEEKDAYS.slice(), hold: false, holdTime: 9 * 60 };
 }
 
-/** 예전에 만든 연결에는 없는 값을 기본값으로 채웁니다. 요일이 생기기 전 연결은 매일 보내던 대로 둡니다. */
+function defaultChanges_() {
+  return { enabled: false, since: 0, sets: [defaultChangeSet_(1)] };
+}
+
+const CHANGE_SET_KEYS = ['types', 'wait', 'past', 'days', 'hold', 'holdTime'];
+
+/**
+ * 세트 목록 형태로 맞춥니다. 세트가 생기기 전 연결은 그때의 설정 그대로 세트 1이 되고,
+ * 요일이 생기기 전 연결은 매일 보내던 대로 둡니다.
+ */
+function normalizeChanges_(saved) {
+  if (!saved) return defaultChanges_();
+  let sets = saved.sets;
+  if (!Array.isArray(sets) || !sets.length) {
+    const legacy = {};
+    CHANGE_SET_KEYS.forEach((k) => {
+      if (k in saved) legacy[k] = saved[k];
+    });
+    if (!saved.days) legacy.days = [0, 1, 2, 3, 4, 5, 6];
+    sets = [legacy];
+  }
+  return {
+    enabled: !!saved.enabled,
+    since: saved.since || 0,
+    sets: sets.map((s, i) => Object.assign(defaultChangeSet_(i + 1), s)),
+  };
+}
+
 function changesOf_(conn) {
-  const saved = conn.changes || {};
-  const c = Object.assign(defaultChanges_(), saved);
-  if (conn.changes && !saved.days) c.days = [0, 1, 2, 3, 4, 5, 6];
-  return c;
+  return normalizeChanges_(conn.changes);
+}
+
+/** 이 알림 종류(created/updated/deleted)를 고른 세트. 없으면 그 종류는 알리지 않습니다. */
+function changeSetFor_(changes, kind) {
+  return changes.sets.find((s) => s.types.includes(kind)) || null;
 }
 
 /** 고르지 않은 요일에 모은 알림을 보낼 시각: now 다음으로 오는 고른 요일의 holdTime */
-function nextHoldRelease_(settings, now) {
+function nextHoldRelease_(set, now) {
   for (let i = 1; i <= 7; i++) {
     const day = kstDayStart_(now) + i * DAY;
-    if (settings.days.includes(kstParts_(day).dow)) return day + settings.holdTime * MINUTE;
+    if (set.days.includes(kstParts_(day).dow)) return day + set.holdTime * MINUTE;
   }
   return null;
 }
@@ -1527,7 +1594,8 @@ function queueChanges_(watchers, changes, now) {
           return;
         }
         // 이미 다음 요일로 미뤄 둔 알림이면 그 시각(holdUntil)을 유지합니다.
-        const holdUntil = pending[key] && pending[key].holdUntil;
+        // 종류가 바뀌면(예: 변경 → 삭제) 다른 세트를 따를 수 있어 미룬 시각을 새로 정합니다.
+        const holdUntil = pending[key] && pending[key].kind === kind && pending[key].holdUntil;
         pending[key] = { chId, connId: conn.id, kind, info: change.info, past: change.past, at: now };
         if (holdUntil) pending[key].holdUntil = holdUntil;
       });
@@ -1549,22 +1617,23 @@ function dispatchChanges_(now) {
       if (!(p.chId in channels)) channels[p.chId] = loadChannel_(p.chId);
       const conn = channels[p.chId] && channels[p.chId].connections.find((c) => c.id === p.connId);
       const settings = conn && changesOf_(conn);
-      if (!conn || conn.paused || !settings.enabled) {
+      // 알림 종류를 고른 세트의 설정(요일·대기·과거 일정·모아 보내기)을 보내는 순간 기준으로 따릅니다.
+      const set = settings && changeSetFor_(settings, p.kind);
+      if (!conn || conn.paused || !settings.enabled || !set) {
         delete pending[key];
         return;
       }
-      if (now < p.at + settings.wait * MINUTE) return; // 아직 기다리는 중
+      if (now < p.at + set.wait * MINUTE) return; // 아직 기다리는 중
       if (p.holdUntil && now < p.holdUntil) return; // 다음 요일로 미뤄 둔 알림
-      if (!p.holdUntil && !settings.days.includes(kstParts_(now).dow)) {
+      if (!p.holdUntil && !set.days.includes(kstParts_(now).dow)) {
         // 고르지 않은 요일: 모아 보내기를 켰으면 돌아오는 첫 요일로 미루고, 아니면 보내지 않습니다.
-        const release = settings.hold && nextHoldRelease_(settings, now);
+        const release = set.hold && nextHoldRelease_(set, now);
         if (release) p.holdUntil = release;
         else delete pending[key];
         return;
       }
       delete pending[key];
-      if (!settings.types.includes(p.kind)) return;
-      if (p.past && !settings.past) return;
+      if (p.past && !set.past) return;
       ready.push(Object.assign({ conn }, p));
     });
     saveChunked_('PENDING', pending);
@@ -1948,8 +2017,16 @@ function context_(text) {
   return { type: 'context', elements: [{ type: 'mrkdwn', text }] };
 }
 
+/** 끝 글자에 받침이 있으면 "을", 없으면 "를"을 붙입니다: 등록을, 삭제를 */
+function withObjectParticle_(word) {
+  const code = word.charCodeAt(word.length - 1) - 0xac00;
+  if (code < 0 || code > 11171) return `${word}을(를)`;
+  return `${word}${code % 28 ? '을' : '를'}`;
+}
+
 function button_(text, actionId, value) {
-  return { type: 'button', text: plain_(text), action_id: actionId, value };
+  // Slack은 버튼 값이 문자열이 아니면 화면 전체를 거부합니다.
+  return { type: 'button', text: plain_(text), action_id: actionId, value: String(value) };
 }
 
 function confirm_(title, text, ok) {
@@ -2029,13 +2106,18 @@ function describeReminder_(r) {
   return [`🔔 일정 알림 (${describeDays_(r.days)})`, when, allDay].join(SEP);
 }
 
-/** "✏️ 변경 알림 (월-금)  |  등록, 삭제만  |  1분 대기 후 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 O (오전 9:00)" */
+/**
+ * 세트마다 한 줄:
+ * "✏️ 변경 알림 (월-금)  |  등록, 삭제만  |  1분 대기 후 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 O (오전 9:00)"
+ */
 function describeChanges_(c) {
-  if (!c.enabled) return null;
-  const picked = Object.keys(CHANGE_KINDS).filter((k) => c.types.includes(k)).map((k) => CHANGE_KINDS[k]);
-  const types = picked.length === Object.keys(CHANGE_KINDS).length ? picked.join(', ') : `${picked.join(', ')}만`;
-  const held = c.hold ? `미설정요일 알림 모아보내기 O (${formatAmPm_(c.holdTime)})` : '미설정요일 알림 모아보내기 X';
-  return [`✏️ 변경 알림 (${describeDays_(c.days)})`, types, `${changeWaitLabel_(c.wait)} 알림`, `과거 일정 변경 알림 ${c.past ? 'O' : 'X'}`, held].join(SEP);
+  if (!c.enabled) return [];
+  return c.sets.map((s) => {
+    const picked = Object.keys(CHANGE_KINDS).filter((k) => s.types.includes(k)).map((k) => CHANGE_KINDS[k]);
+    const types = picked.length === Object.keys(CHANGE_KINDS).length ? picked.join(', ') : `${picked.join(', ')}만`;
+    const held = s.hold ? `미설정요일 알림 모아보내기 O (${formatAmPm_(s.holdTime)})` : '미설정요일 알림 모아보내기 X';
+    return [`✏️ 변경 알림 (${describeDays_(s.days)})`, types, `${changeWaitLabel_(s.wait)} 알림`, `과거 일정 변경 알림 ${s.past ? 'O' : 'X'}`, held].join(SEP);
+  });
 }
 
 function changeWaitLabel_(wait) {
@@ -2076,7 +2158,7 @@ function channelModal_(chId, userId) {
   ch.connections.forEach((conn) => {
     // 캘린더 이름(구글 캘린더 링크) + 켜 둔 루틴 요약 + 일시정지·오류일 때만 상태 줄. 꺼 둔 루틴은 줄을 뺍니다.
     // 일시정지 중이면 루틴 줄마다 취소선을 긋습니다.
-    const routines = [describeDaily_(conn.daily), describeReminder_(conn.reminder), describeChanges_(changesOf_(conn))]
+    const routines = [describeDaily_(conn.daily), describeReminder_(conn.reminder), ...describeChanges_(changesOf_(conn))]
       .filter(Boolean)
       .map((line) => (conn.paused ? `~${line}~` : line));
     const summary = section_(`*<${calendarLink_(conn.calendarId)}|${escapeSlack_(conn.calendarName)}>*`);
@@ -2185,7 +2267,7 @@ function changeCalendarModal_(chId, conn, parentViewId) {
  */
 function connModal_(chId, conn, parentViewId, draft) {
   draft = draft || JSON.parse(JSON.stringify({ daily: conn.daily, reminder: conn.reminder, changes: changesOf_(conn) }));
-  draft.changes = Object.assign(defaultChanges_(), draft.changes || {});
+  draft.changes = normalizeChanges_(draft.changes);
   const d = draft.daily;
   const r = draft.reminder;
   const c = draft.changes;
@@ -2220,54 +2302,80 @@ function connModal_(chId, conn, parentViewId, draft) {
   if (problems.none) blocks.push(context_(':warning: 하루 요약, 일정 알림, 변경 알림 중 하나 이상 켜야 저장됩니다.'));
   if (problems.daily) blocks.push(context_(':warning: 하루 요약의 요일을 하나 이상 고르세요.'));
   if (problems.reminder) blocks.push(context_(':warning: 일정 알림의 요일을 하나 이상 고르세요.'));
-  if (problems.changes) blocks.push(context_(':warning: 변경 알림의 알림 종류를 하나 이상 고르세요.'));
-  if (problems.changesDays) blocks.push(context_(':warning: 변경 알림의 요일을 하나 이상 고르세요.'));
+  const setNames = (nums) => nums.map((n) => `세트 ${n}`).join(', ');
+  // 변경 알림 경고는 변경 알림 탭에서는 [켜짐] 버튼 바로 아래에, 다른 탭을 보고 있을 때는 여기에 둡니다.
+  const onChanges = tab === 'changes';
+  const where = onChanges ? '' : '변경 알림 ';
+  const changeWarnings = [];
+  if (problems.changes) changeWarnings.push(context_(`:warning: ${where}${setNames(problems.changes)}의 알림 종류를 하나 이상 고르세요.`));
+  if (problems.changesDays) changeWarnings.push(context_(`:warning: ${where}${setNames(problems.changesDays)}의 요일을 하나 이상 고르세요.`));
+  if (problems.changesDup) changeWarnings.push(context_(`:warning: ${where}${withObjectParticle_(problems.changesDup.join(', '))} 여러 세트에서 골랐습니다. 알림 종류마다 한 세트에만 넣으세요.`));
+  if (!onChanges) blocks.push(...changeWarnings);
   blocks.push({ type: 'divider' });
 
   if (tab === 'daily') {
-    blocks.push(routineHeader_('daily', '*하루 요약*\n정한 시각에 그날 일정을 한 번에 보냅니다.', d.enabled));
+    blocks.push(routineHeader_('daily', '*하루 요약*\n등록되어있는 당일 일정을 일정한 시각에 알립니다.', d.enabled));
     if (d.enabled) {
       // 채널 설정 화면의 요약 줄과 같은 순서: 요일 → 시각 → 범위 → 그 밖의 설정
       blocks.push(
         dayPicker_('daily', d.days),
         timePicker_('daily_time', '보내는 시각', d.time),
+        { type: 'divider' },
         input_('daily_scope', '범위', select_(scopes, d.scope)),
         input_('daily_empty', '일정이 없는 날', { type: 'radio_buttons', options: empties, initial_option: findOption_(empties, d.empty) }),
       );
     }
   } else if (tab === 'reminder') {
-    blocks.push(routineHeader_('reminder', '*일정 알림*\n일정마다 정한 시점에 알립니다. 요일은 일정이 있는 날 기준입니다.', r.enabled));
+    blocks.push(routineHeader_('reminder', '*일정 알림*\n일정에 등록된 시간에 맞춰 알림을 받습니다.', r.enabled));
     if (r.enabled) {
       // 요약 줄과 같은 순서: 요일 → 알림 시점 → 종일 일정 알림
       blocks.push(dayPicker_('reminder', r.days), input_('reminder_offset', '시간 일정 알림 시점', select_(offsets, r.offset)));
       // 종일 일정은 시작 시각이 없어 따로 켜고, 켜면 알릴 시각을 고릅니다.
-      const allDay = section_('*종일 일정 알림*\n종일 일정은 정한 시각에 알립니다.');
+      const allDay = section_('*종일 일정 알림*\n종일로 설정된 일정은 일정한 시각에 알립니다.');
       allDay.block_id = 'reminder_allday_enabled';
       allDay.accessory = Object.assign(button_(r.allDay ? '● 켜짐' : '○ 꺼짐', 'toggle_routine', 'allday'), r.allDay ? { style: 'primary' } : {});
-      blocks.push(allDay);
+      blocks.push({ type: 'divider' }, allDay);
       if (r.allDay) blocks.push(timePicker_('reminder_allday_time', '종일 일정 알림 시각', r.allDayTime));
     }
   } else {
-    blocks.push(routineHeader_('changes', '*변경 알림*\n일정이 등록·변경·삭제되면 알립니다. 이어서 고치면 마지막 변경 뒤 정한 시간만큼 기다렸다가 최종 내용만 보냅니다.', c.enabled));
+    blocks.push(routineHeader_('changes', '*변경 알림*\n일정이 등록·변경·삭제되면 알림을 받습니다. 발송 시점으로 설정된 시간 동안 다시 변경하면 마지막 상태만 알림을 받습니다.', c.enabled));
+    if (c.enabled) blocks.push(...changeWarnings);
     if (c.enabled) {
       const kinds = Object.keys(CHANGE_KINDS).map((k) => option_(CHANGE_KINDS[k], k));
-      const kindPicker = { type: 'multi_static_select', options: kinds, placeholder: plain_('알림 종류 고르기') };
-      const picked = kinds.filter((o) => c.types.includes(o.value));
-      if (picked.length) kindPicker.initial_options = picked;
       const waits = CHANGE_WAITS.map((w) => option_(changeWaitLabel_(w), w));
       const pasts = [option_('알리지 않음', 'off'), option_('알림', 'on')];
-      // 요약 줄과 같은 순서: 요일 → 알림 종류 → 발송 시점 → 과거 일정 → 미설정요일 알림 모아보내기
-      blocks.push(
-        dayPicker_('changes', c.days),
-        input_('changes_types', '알림 종류', kindPicker),
-        input_('changes_wait', '발송 시점', select_(waits, c.wait)),
-        input_('changes_past', '과거 일정에 대한 변경 알림', { type: 'radio_buttons', options: pasts, initial_option: findOption_(pasts, c.past ? 'on' : 'off') }),
-      );
-      const hold = section_('*미설정요일 알림 모아보내기*\n고르지 않은 요일에 생긴 변경을 모아 두었다가 돌아오는 첫 요일에 보냅니다. 끄면 그 알림은 보내지 않습니다.');
-      hold.block_id = 'changes_hold_enabled';
-      hold.accessory = Object.assign(button_(c.hold ? '● 켜짐' : '○ 꺼짐', 'toggle_routine', 'hold'), c.hold ? { style: 'primary' } : {});
-      blocks.push(hold);
-      if (c.hold) blocks.push(timePicker_('changes_hold_time', '모아 보내는 시각', c.holdTime));
+      // 세트마다 같은 항목을 둡니다. 입력칸 이름에는 순서가 아닌 세트 id를 넣어, 세트를 지워도 Slack이 다른 세트의 입력값을 옮겨 붙이지 않게 합니다.
+      c.sets.forEach((s, i) => {
+        const p = `changes_${s.id}`;
+        const head = section_(`*세트 ${i + 1}*`);
+        head.block_id = `${p}_set`;
+        if (i > 0) head.accessory = button_('삭제', 'remove_change_set', s.id);
+        const kindPicker = { type: 'multi_static_select', options: kinds, placeholder: plain_('알림 종류 고르기') };
+        const picked = kinds.filter((o) => s.types.includes(o.value));
+        if (picked.length) kindPicker.initial_options = picked;
+        // 요약 줄과 같은 순서: 요일 → 알림 종류 → 발송 시점 → 과거 일정 → 미설정요일 알림 모아보내기
+        blocks.push(
+          { type: 'divider' },
+          // 세트 제목 위 여백: 채널 설정 화면과 같은 여백용 이미지를 씁니다.
+          { type: 'context', elements: [{ type: 'image', image_url: SPACER_IMAGE, alt_text: ' ' }] },
+          head,
+          dayPicker_(p, s.days),
+          input_(`${p}_types`, '알림 종류', kindPicker),
+          input_(`${p}_wait`, '발송 시점', select_(waits, s.wait)),
+          { type: 'divider' },
+          input_(`${p}_past`, '과거 일정에 대한 변경 알림', { type: 'radio_buttons', options: pasts, initial_option: findOption_(pasts, s.past ? 'on' : 'off') }),
+          { type: 'divider' },
+        );
+        const hold = section_('*미설정요일 알림 모아보내기*\n설정하지 않은 요일에 발생한 변경은 알림을 보내지 않고 모아 두었다가, 돌아오는 첫 요일에 한 번에 알림을 받습니다.');
+        hold.block_id = `${p}_hold_enabled`;
+        hold.accessory = Object.assign(button_(s.hold ? '● 켜짐' : '○ 꺼짐', 'toggle_routine', `hold:${s.id}`), s.hold ? { style: 'primary' } : {});
+        blocks.push(hold);
+        if (s.hold) blocks.push(timePicker_(`${p}_hold_time`, '모아 보내는 시각', s.holdTime));
+      });
+      // 종류마다 한 세트에만 넣을 수 있어 세트는 최대 3개입니다.
+      if (c.sets.length < Object.keys(CHANGE_KINDS).length) {
+        blocks.push({ type: 'divider' }, { type: 'actions', block_id: 'changes_add_set', elements: [button_('+ 세트 추가', 'add_change_set', 'add')] });
+      }
     }
   }
 
