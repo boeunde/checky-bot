@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.0.4
+ * checky-bot v1.0.5
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -830,6 +830,18 @@ function isBotMember_(chId) {
     return !!slackApi_('conversations.info', { channel: chId }).channel.is_member;
   } catch (err) {
     return false;
+  }
+}
+
+/**
+ * 봇이 채널에서 나간 게 확실할 때만 true. Slack이 "멤버 아님" 또는 "채널 없음"이라고 답한 경우입니다.
+ * 그 밖의 오류(일시 장애 등)는 확실하지 않으므로 false입니다.
+ */
+function botLeftChannel_(chId) {
+  try {
+    return slackApi_('conversations.info', { channel: chId }).channel.is_member === false;
+  } catch (err) {
+    return ['channel_not_found', 'is_archived'].includes(err.slackError);
   }
 }
 
@@ -2577,9 +2589,15 @@ function publishHome_(userId) {
   ];
 
   // 캘린더가 연결된 채널과 내가 관리자인 채널을 보여 주고, 관리자인 채널에는 [설정] 버튼을 붙입니다.
-  const channels = meta.channels
-    .map(loadChannel_)
-    .filter((ch) => ch && (ch.connections.length || isAdmin_(ch, userId)))
+  // 캘린더가 없는 채널에서 봇이 이미 나갔으면(나간 이벤트를 놓친 경우) 여기서 기록을 지웁니다.
+  const loaded = meta.channels.map(loadChannel_).filter((ch) => {
+    if (!ch) return false;
+    if (ch.connections.length || !botLeftChannel_(ch.id)) return true;
+    forgetChannel_(ch.id);
+    return false;
+  });
+  const channels = loaded
+    .filter((ch) => ch.connections.length || isAdmin_(ch, userId))
     .slice(0, HOME_CHANNEL_LIMIT);
   channels.forEach((ch) => {
     // 봇이 나가 일시정지된 채널은 다시 초대하면 이어 쓸 수 있어 목록에 남기고 상태를 붙입니다.

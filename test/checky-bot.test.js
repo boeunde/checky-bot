@@ -739,6 +739,19 @@ const tests = {
     assert.strictEqual(empty.state.props.CH_C2, undefined);
     empty.event({ type: 'app_home_opened', user: 'UA', tab: 'home' });
     assert.ok(!JSON.stringify(empty.calls('views.publish').at(-1).params.view).includes('<#C2>'));
+    // If the leave event was missed, opening the home tab cleans up channels the bot is no longer in.
+    const missed = createEnv('2026-11-09T10:00');
+    missed.run('setup');
+    ['C3', 'C4', 'C5'].forEach((id) => missed.event({ type: 'member_joined_channel', user: 'UBOT', channel: id, inviter: 'UA' }));
+    missed.state.members.add('C4'); // still a member
+    const realFetch = missed.sandbox.UrlFetchApp.fetch;
+    missed.sandbox.UrlFetchApp.fetch = (url, opts) => (url.endsWith('conversations.info') && opts.payload.channel === 'C5'
+      ? { getContentText: () => JSON.stringify({ ok: false, error: 'ratelimited' }), getResponseCode: () => 200 }
+      : realFetch(url, opts));
+    missed.event({ type: 'app_home_opened', user: 'UA', tab: 'home' });
+    assert.deepStrictEqual(missed.meta().channels, ['C4', 'C5'], 'C3 (bot gone) is forgotten; C4 (member) and C5 (unclear error) stay');
+    assert.ok(!JSON.stringify(missed.calls('views.publish').at(-1).params.view).includes('<#C3>'));
+
     // Inviting the bot again starts fresh, with the inviter as admin.
     empty.event({ type: 'member_joined_channel', user: 'UBOT', channel: 'C2', inviter: 'UB' });
     assert.deepStrictEqual(JSON.parse(empty.state.props.CH_C2).admins, ['UB']);
