@@ -16,6 +16,14 @@ Slack Google Calendar 앱이 채널에 보낸 공지 원문입니다.
 
 ![Slack Google Calendar app notice: this channel will stop receiving notifications from the linked calendar starting December 15th, 2026. Linking a calendar to a channel is being retired.](docs/images/slack-google-calendar-notice.png)
 
+## 작동 예시
+
+채널에 온 **오늘 요약** 메시지입니다. 정한 시각에 그날 일정을 캘린더 색 막대와 함께 보냅니다.
+
+![Checky Bot daily summary message in a Slack channel: 오늘 요약 | date | calendar, with an all-day event](docs/images/daily-summary-example.png)
+
+> 참고: 봇 프로필 이미지([THUMBNAIL.png](THUMBNAIL.png))에는 이 봇을 사용하는 (주)아크로버스크리에이티브의 아이덴티티가 적용되어 있습니다.
+
 ## 사용법
 
 1. 알림을 받을 채널에 봇을 초대합니다: `/invite @Checky Bot`. 초대한 사람이 그 채널의 첫 **채널 봇 관리자**가 됩니다.

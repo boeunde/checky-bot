@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.0.3
+ * checky-bot v1.0.4
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
