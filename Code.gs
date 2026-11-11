@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.0.1
+ * checky-bot v1.0.2
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -43,12 +43,12 @@ const REMOVED_ERRORS = ['not_in_channel', 'channel_not_found', 'is_archived'];
 const TRIGGER_HANDLERS = ['dispatchDue', 'rebuildSchedule', 'onCalendarChanged'];
 
 const HELP_TEXT = [
-  '*checky-bot 사용법*',
-  '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`',
+  '*Checky Bot 사용법*',
+  '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @Checky Bot`',
   '2. 그 채널에서 `/checky`를 입력해 캘린더를 연결하고 알림을 설정합니다.',
   '• `/checky today`: 이 채널 캘린더의 오늘 일정을 나에게만 보여 줍니다.',
   '• `/checky today-all`: 오늘 일정을 채널에 보냅니다 (채널 관리자만).',
-  '• 봇 메시지 지우기: 메시지의 ⋯ 메뉴 > checky-bot 메시지 삭제 (채널 관리자만)',
+  '• 봇 메시지 지우기: 메시지의 ⋯ 메뉴 > Checky Bot 메시지 삭제 (채널 관리자만)',
 ].join('\n');
 
 // ─── 설치와 자동 실행 ─────────────────────────────────────
@@ -723,7 +723,7 @@ function onBotJoined_(chId, inviter) {
     addLog_(c, inviter, '봇을 초대해 첫 관리자가 됨');
   });
   registerInstallerIfNone_(inviter);
-  postEphemeral_(chId, inviter, 'checky-bot을 초대하셨습니다. 이 채널의 관리자로 지정되었습니다. `/checky`를 입력해 캘린더를 연결하세요.');
+  postEphemeral_(chId, inviter, 'Checky Bot을 초대하셨습니다. 이 채널의 관리자로 지정되었습니다. `/checky`를 입력해 캘린더를 연결하세요.');
 }
 
 function handleCommand_(p) {
@@ -739,7 +739,7 @@ function handleCommand_(p) {
   const ch = loadChannel_(p.channel_id);
   if (!ch || !ch.admins.length) {
     if (!isBotMember_(p.channel_id)) {
-      return ephemeralJson_('먼저 이 채널에 checky-bot을 초대하세요: `/invite @checky-bot`');
+      return ephemeralJson_('먼저 이 채널에 Checky Bot을 초대하세요: `/invite @Checky Bot`');
     }
     // 초대 기록이 없는 채널(예: 설치를 마치기 전에 초대된 채널)은 처음 /checky를 실행한 사람이 관리자가 됩니다.
     if (!ineligibleReason_(p.user_id)) {
@@ -1205,14 +1205,14 @@ function handleDeleteMessage_(payload, userId) {
   const message = payload.message || {};
   const respond = (text) => respondEphemeral_(payload.response_url, text);
   if (!isAdmin_(loadChannel_(chId), userId)) {
-    respond('이 채널의 관리자만 checky-bot 메시지를 지울 수 있습니다.');
+    respond('이 채널의 관리자만 Checky Bot 메시지를 지울 수 있습니다.');
     return;
   }
   const fromBot = message.user === botUserId_()
     || (message.bot_profile && message.bot_profile.app_id === payload.api_app_id)
     || (message.app_id && message.app_id === payload.api_app_id);
   if (!fromBot) {
-    respond('checky-bot이 보낸 메시지만 지울 수 있습니다.');
+    respond('Checky Bot이 보낸 메시지만 지울 수 있습니다.');
     return;
   }
   // 실수로 지우지 않도록 확인 창을 먼저 띄웁니다. 삭제는 확인 창의 [삭제]를 눌러야 실행됩니다.
@@ -1787,7 +1787,7 @@ function pauseChannelForRemoval_(chId) {
     addLog_(c, null, '봇이 채널에서 나가 모든 연결을 일시정지함');
   });
   invalidateSchedule_();
-  notifyInstaller_(`⏸️ checky-bot이 <#${chId}> 채널에서 나가, 이 채널의 연결 ${targets.length}개를 일시정지했습니다. 봇을 다시 초대한 뒤 채널 관리자가 \`/checky\`에서 [다시 시작]을 누르세요.`);
+  notifyInstaller_(`⏸️ Checky Bot이 <#${chId}> 채널에서 나가, 이 채널의 연결 ${targets.length}개를 일시정지했습니다. 봇을 다시 초대한 뒤 채널 관리자가 \`/checky\`에서 [다시 시작]을 누르세요.`);
 }
 
 function notifyInstaller_(text) {
@@ -1849,7 +1849,7 @@ function recordUsage_(name, ms, at) {
   if (warn) today.warned = true;
   saveJson_('USAGE', usage);
   if (warn) {
-    notifyInstaller_(`:warning: checky-bot의 오늘 자동 실행 시간이 ${Math.round(total / MINUTE)}분입니다. 하루 ${USAGE_LIMIT_MINUTES}분을 넘으면 그날 남은 시간 동안 알림이 멈춥니다. 연결한 캘린더 수를 줄이거나 Apps Script 실행 기록을 확인하세요.`);
+    notifyInstaller_(`:warning: Checky Bot의 오늘 자동 실행 시간이 ${Math.round(total / MINUTE)}분입니다. 하루 ${USAGE_LIMIT_MINUTES}분을 넘으면 그날 남은 시간 동안 알림이 멈춥니다. 연결한 캘린더 수를 줄이거나 Apps Script 실행 기록을 확인하세요.`);
   }
 }
 
@@ -2200,7 +2200,7 @@ function calendarLink_(calendarId) {
 function formatLog_(entry) {
   const at = entry.text.indexOf(': ');
   const head = at > 0 ? `${entry.text.slice(at + 2)}${SEP}${entry.text.slice(0, at)}` : entry.text;
-  return `*${head}*\n${entry.user ? `<@${entry.user}>` : 'checky-bot'}${SEP}${formatLogTime_(entry.at)}`;
+  return `*${head}*\n${entry.user ? `<@${entry.user}>` : 'Checky Bot'}${SEP}${formatLogTime_(entry.at)}`;
 }
 
 function channelModal_(chId, userId) {
@@ -2496,7 +2496,7 @@ function deleteConfirmModal_(chId, message, responseUrl) {
     close: plain_('취소'),
     private_metadata: JSON.stringify({ channelId: chId, ts: message.ts, responseUrl }),
     blocks: [
-      section_('이 checky-bot 메시지를 삭제할까요? 삭제하면 되돌릴 수 없습니다.'),
+      section_('이 Checky Bot 메시지를 삭제할까요? 삭제하면 되돌릴 수 없습니다.'),
       context_(messagePreview_(message)),
     ],
   };
@@ -2548,7 +2548,7 @@ function publishHome_(userId) {
     { type: 'divider' },
     section_([
       '\n　\n*사용 방법*',
-      '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @checky-bot`',
+      '1. 알림을 받을 채널에 봇을 초대합니다: `/invite @Checky Bot`',
       '2. 해당 채널에서 `/checky` 명령어를 입력하고 캘린더를 연결합니다.',
       '3. 캘린더마다 알림 루틴을 설정합니다.',
     ].join('\n')),

@@ -354,7 +354,7 @@ const tests = {
     const env = createEnv('2026-11-09T10:00');
     env.run('setup');
     const out = env.command({ user_id: 'UA', channel_id: 'C9' });
-    assert.ok(response(out).text.includes('/invite @checky-bot'));
+    assert.ok(response(out).text.includes('/invite @Checky Bot'));
     assert.strictEqual(env.calls('views.open').length, 0);
   },
 
