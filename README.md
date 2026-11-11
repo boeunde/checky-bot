@@ -2,6 +2,20 @@
 
 Checky Bot은 여러 Google 공유 캘린더의 일정을 여러 Slack 채널로 알려 주는 봇입니다. 설정은 모두 Slack에서 합니다. 기획은 [docs/spec.md](docs/spec.md)에 있습니다.
 
+> **English:** Checky Bot posts shared Google Calendar events to Slack channels — a replacement for the Slack Google Calendar app's channel notifications, which end on December 15, 2026. It runs on Google Apps Script (no server) and is configured entirely inside Slack: daily summaries, event reminders, and created/updated/deleted event alerts.
+
+## 제작 배경
+
+Slack의 Google Calendar 앱에서 **캘린더를 채널에 연결하는 기능이 2026년 12월 15일에 종료**됩니다. 이후에는 개인 사이드바 알림만 남아, 팀 공유 캘린더 일정을 채널로 받아 보던 방식(슬랙 구글 캘린더 채널 알림)을 더 쓸 수 없습니다. Checky Bot은 이 기능을 대체하려고 만들었습니다.
+
+Slack Google Calendar 앱이 채널에 보낸 공지 원문입니다.
+
+> :calendar: Heads up: this channel will stop receiving notifications from the linked calendar starting **December 15th, 2026**. Linking a calendar to a channel is being retired. You will receive your individual sidebar notifications and system notifications. Learn how to connect your Outlook Calendar or Google Calendar.
+>
+> — Slack Google Calendar 앱 공지
+
+![Slack Google Calendar app notice: this channel will stop receiving notifications from the linked calendar starting December 15th, 2026. Linking a calendar to a channel is being retired.](docs/images/slack-google-calendar-notice.png)
+
 ## 사용법
 
 1. 알림을 받을 채널에 봇을 초대합니다: `/invite @Checky Bot`. 초대한 사람이 그 채널의 첫 **채널 봇 관리자**가 됩니다.
