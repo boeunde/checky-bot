@@ -726,6 +726,22 @@ const tests = {
     const kicked = connectedEnv('2026-11-09T08:50', events);
     kicked.event({ type: 'channel_left', channel: 'C1' });
     assert.strictEqual(kicked.channel('C1').connections[0].pausedReason, 'removed');
+    kicked.event({ type: 'app_home_opened', user: 'UA', tab: 'home' });
+    assert.ok(JSON.stringify(kicked.calls('views.publish').at(-1).params.view).includes('⏸️ 봇이 채널에서 나감'), 'paused channels stay on the home tab with a status');
+
+    // A channel with no calendars is forgotten when the bot leaves, so it drops off the home tab.
+    const empty = createEnv('2026-11-09T10:00');
+    empty.run('setup');
+    empty.event({ type: 'member_joined_channel', user: 'UBOT', channel: 'C2', inviter: 'UA' });
+    assert.ok(empty.meta().channels.includes('C2'));
+    empty.event({ type: 'group_left', channel: 'C2' });
+    assert.ok(!empty.meta().channels.includes('C2'));
+    assert.strictEqual(empty.state.props.CH_C2, undefined);
+    empty.event({ type: 'app_home_opened', user: 'UA', tab: 'home' });
+    assert.ok(!JSON.stringify(empty.calls('views.publish').at(-1).params.view).includes('<#C2>'));
+    // Inviting the bot again starts fresh, with the inviter as admin.
+    empty.event({ type: 'member_joined_channel', user: 'UBOT', channel: 'C2', inviter: 'UB' });
+    assert.deepStrictEqual(JSON.parse(empty.state.props.CH_C2).admins, ['UB']);
   },
 
   'deleting a bot message asks for confirmation; only channel admins, only bot messages': () => {

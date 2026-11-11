@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.0.2
+ * checky-bot v1.0.3
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -696,7 +696,7 @@ function handleEvent_(event) {
       break;
     case 'channel_left':
     case 'group_left':
-      pauseChannelForRemoval_(event.channel);
+      onBotRemoved_(event.channel);
       break;
     default:
       break;
@@ -1767,16 +1767,24 @@ function setConnectionError_(chId, conn, error) {
 
 function handleSendFailure_(chId, err) {
   if (REMOVED_ERRORS.includes(err.slackError)) {
-    pauseChannelForRemoval_(chId);
+    onBotRemoved_(chId);
     return;
   }
   notifyInstallerOnce_(`send|${chId}|${err.slackError || 'unknown'}`, `:warning: <#${chId}> 채널에 알림을 보내지 못했습니다: ${err.message}`);
 }
 
 /** 봇이 채널에서 나가면 그 채널의 연결을 모두 일시정지하고 설치자에게 알립니다. */
-function pauseChannelForRemoval_(chId) {
+/**
+ * 봇이 채널에서 나가면: 연결이 없는 채널은 기록(관리자·변경 기록)을 지워 홈 목록에서도 빠지게 하고,
+ * 연결이 있는 채널은 다시 초대했을 때 이어 쓰도록 기록을 남긴 채 모두 일시정지합니다.
+ */
+function onBotRemoved_(chId) {
   const ch = loadChannel_(chId);
   if (!ch) return;
+  if (!ch.connections.length) {
+    forgetChannel_(chId);
+    return;
+  }
   const targets = ch.connections.filter((c) => c.pausedReason !== 'removed');
   if (!targets.length) return;
   updateChannel_(chId, (c) => {
@@ -1926,6 +1934,18 @@ function updateChannel_(chId, fn) {
       saveJson_('META', meta);
     }
     return result;
+  });
+}
+
+/** 채널 기록을 지우고 채널 목록에서 뺍니다. 다시 초대하면 처음부터 시작합니다. */
+function forgetChannel_(chId) {
+  withLock_(() => {
+    PropertiesService.getScriptProperties().deleteProperty(`CH_${chId}`);
+    const meta = loadMeta_();
+    if (meta.channels.includes(chId)) {
+      meta.channels = meta.channels.filter((id) => id !== chId);
+      saveJson_('META', meta);
+    }
   });
 }
 
@@ -2562,7 +2582,11 @@ function publishHome_(userId) {
     .filter((ch) => ch && (ch.connections.length || isAdmin_(ch, userId)))
     .slice(0, HOME_CHANNEL_LIMIT);
   channels.forEach((ch) => {
-    const row = section_(`●  <#${ch.id}>\n　 캘린더 ${ch.connections.length}개${SEP}관리자 ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`);
+    // 봇이 나가 일시정지된 채널은 다시 초대하면 이어 쓸 수 있어 목록에 남기고 상태를 붙입니다.
+    const left = ch.connections.length && ch.connections.every((c) => c.pausedReason === 'removed');
+    const parts = [`캘린더 ${ch.connections.length}개`, `관리자 ${ch.admins.map((u) => `<@${u}>`).join(', ') || '없음'}`];
+    if (left) parts.push('⏸️ 봇이 채널에서 나감');
+    const row = section_(`●  <#${ch.id}>\n　 ${parts.join(SEP)}`);
     if (isAdmin_(ch, userId)) row.accessory = button_('설정', 'open_channel', ch.id);
     blocks.push(row);
   });
