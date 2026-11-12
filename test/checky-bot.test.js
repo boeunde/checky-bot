@@ -173,6 +173,15 @@ function createEnv(nowIso) {
       newTrigger: triggerBuilder,
     },
     UrlFetchApp: { fetch: (url, opts) => {
+      if (url.includes('emoji-datasource')) {
+        state.emojiFetches = (state.emojiFetches || 0) + 1;
+        const data = [
+          { unified: '1F313', short_names: ['first_quarter_moon'] },
+          { unified: '231B', short_names: ['hourglass'] },
+          { unified: '1F44D', short_names: ['+1', 'thumbsup'] },
+        ];
+        return { getContentText: () => JSON.stringify(data), getResponseCode: () => 200 };
+      }
       if (url.startsWith('https://slack.com/api/')) {
         assert.strictEqual(opts.headers.Authorization, 'Bearer xoxb-test');
         const params = Object.assign({}, opts.payload);
@@ -724,14 +733,14 @@ const tests = {
     assert.deepStrictEqual([update.channel, update.ts], ['C1', '5.0'], 'the same message is edited, not reposted');
     assert.strictEqual(env.posts('C1').length, 0, 'nothing new is posted, so no new notification');
     assert.strictEqual(flatten({ params: update }), [
-      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', '종일 | 박보은[first_quarter_moon]반차/오후 (1/2)', '매주 화요일, 13회',
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', '종일 | 박보은🌓반차/오후 (1/2)', '매주 화요일, 13회',
       '14:00 - 15:00 | A & B 회의',
       '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건', '일정 없음',
     ].join('\n'));
-    assert.deepStrictEqual(linksOf(update).map((l) => [l.url, l.text]), [['https://cal/e1', '박보은'], ['https://cal/e1', '반차/오후'], ['https://cal/e2', 'A & B 회의']],
-      'titles become rich_text links, split around the emoji (an emoji element cannot sit inside link text)');
+    assert.deepStrictEqual(linksOf(update).map((l) => [l.url, l.text]), [['https://cal/e1', '박보은🌓반차/오후'], ['https://cal/e2', 'A & B 회의']],
+      'emoji codes go back to the emoji character, so the title stays one link (same as a freshly sent message)');
     assert.deepStrictEqual(update.attachments.map((a) => a.color), ['#4285F4', '#4285F4', '#E67C73']);
-    assert.strictEqual(update.attachments[0].fallback, `디자인팀 · 종일 ${title}`);
+    assert.strictEqual(update.attachments[0].fallback, '디자인팀 · 종일 박보은🌓반차/오후', 'the lock-screen text gets the emoji character too');
     assert.ok(said().includes('새 형식으로 고쳤습니다'));
 
     shortcut('UA', deleted);
@@ -746,18 +755,32 @@ const tests = {
     const stale = { user: 'UBOT', ts: '7.0', text: '', attachments: [{ color: '4285F4', fallback: 'x', blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: '*일정 알림* | 디자인팀 | 총 1건' } },
       { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [
-        { type: 'text', text: '10:30 - 11:00 | ' }, { type: 'link', url: 'https://cal/e3', text: '마감:hourglass::skin-tone-3:' },
+        { type: 'text', text: '10:30 - 11:00 | ' }, { type: 'link', url: 'https://cal/e3', text: ':hourglass:마감:+1::skin-tone-3::party_parrot:' },
       ] }] },
     ] }] };
     shortcut('UA', stale);
     const refixed = env.calls('chat.update').at(-1).params;
     assert.strictEqual(refixed.ts, '7.0');
     assert.deepStrictEqual(refixed.attachments[0].blocks[1].elements[0].elements, [
-      { type: 'text', text: '10:30 - 11:00 | ' }, { type: 'link', url: 'https://cal/e3', text: '마감' }, { type: 'emoji', name: 'hourglass', skin_tone: 3 },
-    ], 'times like 10:30 stay text; :name: becomes an emoji element');
+      { type: 'text', text: '10:30 - 11:00 | ' }, { type: 'link', url: 'https://cal/e3', text: '⌛마감👍🏼' }, { type: 'emoji', name: 'party_parrot' },
+    ], 'times like 10:30 stay text; known :name: codes become the emoji character inside the link, unknown (custom) ones an emoji element');
     assert.strictEqual(refixed.attachments[0].color, '#4285F4');
     shortcut('UA', Object.assign({}, stale, { attachments: refixed.attachments }));
     assert.ok(said().includes('이미 새 형식'));
+
+    // Fixed by v1.1.4, which split the link around an emoji element: joined back into one link.
+    const split = { user: 'UBOT', ts: '7.5', text: '', attachments: [{ color: '4285F4', fallback: 'x', blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건' } },
+      { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [
+        { type: 'text', text: '종일 | ' }, { type: 'emoji', name: 'hourglass' }, { type: 'link', url: 'https://cal/e1', text: '박보은' },
+        { type: 'emoji', name: 'first_quarter_moon' }, { type: 'link', url: 'https://cal/e1', text: '반차/오후' }, { type: 'text', text: ' (1/2)' },
+      ] }] },
+    ] }] };
+    shortcut('UA', split);
+    assert.deepStrictEqual(env.calls('chat.update').at(-1).params.attachments[0].blocks[1].elements[0].elements, [
+      { type: 'text', text: '종일 | ' }, { type: 'link', url: 'https://cal/e1', text: '⌛박보은🌓반차/오후' }, { type: 'text', text: ' (1/2)' },
+    ]);
+    assert.strictEqual(env.state.emojiFetches, 1, 'the emoji name table is fetched once, then cached');
 
     // v1.1.0 format: header as a message block outside the bar, notification text in message.text, no | separators.
     const v110 = {

@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.1.4
+ * checky-bot v1.1.5
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -1319,6 +1319,7 @@ function handleRefreshMessage_(payload, userId) {
     fixed[0].blocks = topHeaders.map(section_).concat(fixed[0].blocks);
     if (message.text) fixed[0].fallback = message.text;
   }
+  fixed.forEach((a) => { a.fallback = emojiText_(a.fallback); }); // 잠금 화면·활동 탭 글자도 이모지 문자로
   // v1.1.3 전 일정 알림 머리글의 "총 n건"은 일정까지 남은 시간("15분 후")으로 바꿉니다.
   const lead = sentReminderLead_(fixed, message.ts);
   if (lead) {
@@ -1361,35 +1362,109 @@ function slackColor_(color) {
 
 /**
  * Slack이 돌려주는 메시지 내용에서 이모지는 그림 문자가 아니라 ":hourglass:" 같은 이름입니다.
- * mrkdwn에서는 그림으로 보이지만 rich_text에서는 글자 그대로 보여서, rich_text 이모지 요소로 바꿉니다.
- * 링크 글자 안에는 이모지 요소를 넣을 수 없어 링크를 이모지 앞뒤로 나눕니다(같은 주소).
- * 이름에 영문자가 하나는 있어야 이모지로 봅니다("10:30:00" 같은 시각은 그대로).
+ * rich_text에서는 이름이 글자 그대로 보여서, 이름을 원래 이모지 문자(⌛)로 되돌립니다.
+ * 그래야 제목 링크가 이모지 앞뒤로 끊기지 않고 하나로 이어집니다(새로 보내는 메시지와 같은 모양).
+ * 문자를 모르는 이름(워크스페이스 커스텀 이모지 등)만 rich_text 이모지 요소로 바꾸고, 그때는 링크를 이모지 앞뒤로 나눕니다.
+ * 이름에 영문자가 하나는 있어야 이모지로 봅니다("10:30:00" 같은 시각은 그대로). 숫자 이름은 :+1: :-1: :100: :1234:만.
  */
-const EMOJI_NAME = /:([a-z0-9_+'-]*[a-z][a-z0-9_+'-]*):(?::skin-tone-([2-6]):)?/;
+const EMOJI_NAME = /:([a-z0-9_+'-]*[a-z][a-z0-9_+'-]*|[+-]1|100|1234):(?::skin-tone-([2-6]):)?/;
+
+// Slack 이모지 이름표(Slack과 같은 iamcal emoji-datasource). 이모지 이름이 있는 메시지를 고칠 때만 받아 6시간 캐시합니다.
+const EMOJI_DATA_URL = 'https://cdn.jsdelivr.net/npm/emoji-datasource@16.0.0/emoji.json';
+const EMOJI_CACHE_KEY = 'emoji_names_v1';
+let emojiTableMemo_ = null;
+
+/** 이모지 이름 → 문자 표. 받지 못하면 빈 표(이모지 요소로 나누는 예전 방식으로 고칩니다). */
+function emojiNameTable_() {
+  if (emojiTableMemo_) return emojiTableMemo_;
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(EMOJI_CACHE_KEY);
+  if (cached) return (emojiTableMemo_ = JSON.parse(cached));
+  const names = {};
+  try {
+    const res = UrlFetchApp.fetch(EMOJI_DATA_URL, { muteHttpExceptions: true });
+    if (res.getResponseCode() === 200) {
+      JSON.parse(res.getContentText()).forEach((e) => {
+        const ch = String(e.unified).split('-').map((h) => String.fromCodePoint(parseInt(h, 16))).join('');
+        (e.short_names || []).forEach((n) => { names[n] = ch; });
+      });
+      cache.put(EMOJI_CACHE_KEY, JSON.stringify(names), 21600);
+    }
+  } catch (err) {
+    console.warn(`이모지 이름표를 받지 못했습니다: ${err.message}`);
+  }
+  return (emojiTableMemo_ = names);
+}
+
+/** ":thumbsup::skin-tone-3:" → 👍🏼. 모르는 이름이면 null */
+function emojiChar_(name, tone) {
+  const base = emojiNameTable_()[name];
+  if (!base || !tone) return base || null;
+  // 피부색은 첫 글자 바로 뒤에 붙이고, 바로 뒤의 변형 선택자 FE0F는 뺍니다(✌️ → ✌🏼, 🏃‍♀️ → 🏃🏼‍♀️).
+  const [first, ...rest] = Array.from(base);
+  if (rest[0] === '\uFE0F') rest.shift();
+  return first + String.fromCodePoint(0x1F3FB + Number(tone) - 2) + rest.join('');
+}
+
+/** 글자 속 아는 ":이름:"을 이모지 문자로 바꿉니다(알림 글자 fallback 등). */
+function emojiText_(text) {
+  if (!text || !EMOJI_NAME.test(text)) return text;
+  return text.replace(new RegExp(EMOJI_NAME.source, 'g'), (m, name, tone) => emojiChar_(name, tone) || m);
+}
 
 function withEmojiBlock_(block) {
   if (!block || block.type !== 'rich_text') return block;
   return Object.assign({}, block, {
     elements: (block.elements || []).map((section) => Object.assign({}, section, {
-      elements: (section.elements || []).flatMap(emojiElements_),
+      elements: joinEmoji_((section.elements || []).flatMap(emojiElements_)),
     })),
   });
 }
 
 function emojiElements_(el) {
   if ((el.type !== 'text' && el.type !== 'link') || !el.text || !EMOJI_NAME.test(el.text)) return [el];
+  const text = emojiText_(el.text);
   const re = new RegExp(EMOJI_NAME.source, 'g');
   const out = [];
   let last = 0;
   let m;
-  while ((m = re.exec(el.text))) {
-    if (m.index > last) out.push(Object.assign({}, el, { text: el.text.slice(last, m.index) }));
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(Object.assign({}, el, { text: text.slice(last, m.index) }));
     const emoji = { type: 'emoji', name: m[1] };
     if (m[2]) emoji.skin_tone = Number(m[2]);
     out.push(emoji);
     last = re.lastIndex;
   }
-  if (last < el.text.length) out.push(Object.assign({}, el, { text: el.text.slice(last) }));
+  if (last < text.length) out.push(Object.assign({}, el, { text: text.slice(last) }));
+  return out;
+}
+
+/**
+ * 앞서 이모지 요소로 나눠 고친 메시지(링크 "박보은" + 🌓 + 링크 "반차/오후")를 다시 하나의 링크로 잇습니다.
+ * 링크 옆의 이모지 요소는 그 제목의 일부였으므로 링크 글자에 넣고, 주소가 같은 링크끼리 합칩니다.
+ */
+function joinEmoji_(elements) {
+  const els = elements.slice();
+  const out = [];
+  els.forEach((el, i) => {
+    let cur = el;
+    if (el.type === 'emoji') {
+      const ch = emojiChar_(el.name, el.skin_tone);
+      if (!ch) { out.push(el); return; }
+      const prev = out[out.length - 1];
+      const next = els[i + 1];
+      if (prev && prev.type === 'link') { out[out.length - 1] = Object.assign({}, prev, { text: prev.text + ch }); return; }
+      if (next && next.type === 'link') { els[i + 1] = Object.assign({}, next, { text: ch + next.text }); return; }
+      cur = { type: 'text', text: ch };
+    }
+    const prev = out[out.length - 1];
+    if (prev && cur.type === 'link' && prev.type === 'link' && prev.url === cur.url
+        && JSON.stringify(prev.style || null) === JSON.stringify(cur.style || null)) {
+      out[out.length - 1] = Object.assign({}, prev, { text: prev.text + cur.text });
+      return;
+    }
+    out.push(cur);
+  });
   return out;
 }
 
