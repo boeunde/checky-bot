@@ -544,11 +544,11 @@ const tests = {
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1);
     const text = env.posts('C1')[0];
-    assert.strictEqual(text, '*일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 | 디자인 리뷰');
+    assert.strictEqual(text, '*일정 알림* | 디자인팀 | 15분 후\n10:30 - 11:00 | 디자인 리뷰');
     const [raw] = env.rawPosts('C1');
     assert.ok(!raw.blocks && raw.text === '', 'nothing outside the color bar (the Slack activity tab would show only that)');
     const head = raw.attachments[0];
-    assert.strictEqual(head.blocks[0].text.text, '*일정 알림* | 디자인팀 | 총 1건', 'the header is the first line inside the color bar');
+    assert.strictEqual(head.blocks[0].text.text, '*일정 알림* | 디자인팀 | 15분 후', 'the header is the first line inside the color bar');
     assert.strictEqual(head.fallback, '디자인팀 · 10:30 - 11:00 디자인 리뷰', 'lock screen and activity tab read the first attachment fallback');
 
     event.start = kst('2026-11-09T10:40');
@@ -575,7 +575,7 @@ const tests = {
     assert.strictEqual(posts.length, 2, 'one message per calendar');
     const design = posts.find((p) => p.attachments[0].blocks[0].text.text.includes('디자인팀'));
     assert.strictEqual(design.attachments.length, 2);
-    assert.ok(design.attachments[0].blocks[0].text.text.endsWith('| 총 2건') && design.attachments[1].blocks[0].type === 'rich_text', 'header once, with count');
+    assert.ok(design.attachments[0].blocks[0].text.text.endsWith('| 15분 후') && design.attachments[1].blocks[0].type === 'rich_text', 'header once, ending with the time left');
 
     events.push(ev('n', '새 일정', '2026-11-09T10:30', '2026-11-09T11:00'));
     env.run('onCalendarChanged');
@@ -611,6 +611,8 @@ const tests = {
     const posts = env.posts('C1');
     assert.strictEqual(posts.length, 2);
     assert.ok(posts[0].includes('워크숍 (1/2)') && posts[1].includes('워크숍 (2/2)'), posts.join('\n'));
+    assert.ok(posts[0].startsWith('*일정 알림* | 디자인팀 | 오늘\n'), 'all-day reminders end the header with 오늘');
+    assert.deepStrictEqual([0, 5, 15, 30, 60].map((o) => env.sandbox.reminderLeadLabel_(o)), ['지금', '5분 후', '15분 후', '30분 후', '1시간 후']);
   },
 
   'private and untitled events are skipped; descriptions are cleaned and shortened': () => {
@@ -756,6 +758,27 @@ const tests = {
     assert.strictEqual(refixed.attachments[0].color, '#4285F4');
     shortcut('UA', Object.assign({}, stale, { attachments: refixed.attachments }));
     assert.ok(said().includes('이미 새 형식'));
+
+    // v1.1.0 format: header as a message block outside the bar, notification text in message.text, no | separators.
+    const v110 = {
+      user: 'UBOT', ts: '8.0', text: '디자인팀 · 일정 등록 · 회의',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*일정 등록* | 디자인팀' } }],
+      attachments: [{ color: '4285F4', fallback: '회의', blocks: [
+        { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [
+          { type: 'text', text: '11월 11일 (수) 16:10 - 20:10 ' }, { type: 'link', url: 'https://cal/e4', text: '회의' },
+        ] }] },
+      ] }],
+    };
+    shortcut('UA', v110);
+    const moved = env.calls('chat.update').at(-1).params;
+    assert.strictEqual(moved.ts, '8.0');
+    assert.deepStrictEqual(moved.blocks, [], 'the header block outside the bar is removed');
+    assert.strictEqual(moved.text, '');
+    assert.strictEqual(flatten({ params: moved }), '*일정 등록* | 디자인팀\n11월 11일 (수) | 16:10 - 20:10 | 회의', 'header inside the bar, | separators added');
+    assert.strictEqual(moved.attachments[0].fallback, '디자인팀 · 일정 등록 · 회의', 'notification text moves to the first attachment');
+    assert.ok(said().includes('새 형식으로 고쳤습니다'));
+    shortcut('UA', Object.assign({}, v110, { text: '', blocks: undefined, attachments: moved.attachments }));
+    assert.ok(said().includes('이미 새 형식'), 'running it again changes nothing');
   },
 
   'event titles link to the event, using the occurrence id for recurring events': () => {
@@ -905,7 +928,7 @@ const tests = {
     assert.ok(!msgs.some((m) => m.includes('[테스트')), 'no test label');
     assert.ok(msgs[0] === '*디자인팀*, *11월 6일 (금)* 에 등록된 일정입니다.');
     assert.ok(msgs.includes('*하루 요약* | 11월 6일 금요일 | 디자인팀 | 총 1건\n14:00 - 15:00 | 금요일 회의'), msgs.join('\n---\n'));
-    assert.ok(msgs.includes('*일정 알림* | 디자인팀 | 총 1건\n14:00 - 15:00 | 금요일 회의'), msgs.join('\n---\n'));
+    assert.ok(msgs.includes('*일정 알림* | 디자인팀 | 15분 후\n14:00 - 15:00 | 금요일 회의'), msgs.join('\n---\n'));
     assert.ok(!msgs.join('\n').includes('목요일 회의') && !msgs.join('\n').includes('다음 회의'));
     assert.strictEqual(env.posts('C1').length, 0);
   },
