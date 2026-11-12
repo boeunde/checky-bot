@@ -546,9 +546,10 @@ const tests = {
     const text = env.posts('C1')[0];
     assert.strictEqual(text, '*일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 디자인 리뷰');
     const [raw] = env.rawPosts('C1');
-    assert.strictEqual(raw.blocks[0].text.text, '*일정 알림* | 디자인팀 | 총 1건', 'the header is a message block, outside the color bar');
-    assert.ok(!blocksText(raw.attachments[0].blocks).join('').includes('디자인팀'));
-    assert.strictEqual(raw.text, '디자인팀 · 10:30 - 11:00 디자인 리뷰', 'notifications read the text');
+    assert.ok(!raw.blocks && raw.text === '', 'nothing outside the color bar (the Slack activity tab would show only that)');
+    const head = raw.attachments[0];
+    assert.strictEqual(head.blocks[0].text.text, '*일정 알림* | 디자인팀 | 총 1건', 'the header is the first line inside the color bar');
+    assert.strictEqual(head.fallback, '디자인팀 · 10:30 - 11:00 디자인 리뷰', 'lock screen and activity tab read the first attachment fallback');
 
     event.start = kst('2026-11-09T10:40');
     event.end = kst('2026-11-09T11:10');
@@ -572,9 +573,9 @@ const tests = {
     env.run('dispatchDue');
     const posts = env.rawPosts('C1');
     assert.strictEqual(posts.length, 2, 'one message per calendar');
-    const design = posts.find((p) => p.blocks[0].text.text.includes('디자인팀'));
+    const design = posts.find((p) => p.attachments[0].blocks[0].text.text.includes('디자인팀'));
     assert.strictEqual(design.attachments.length, 2);
-    assert.ok(design.blocks.length === 1 && design.blocks[0].text.text.endsWith('| 총 2건'), 'header once, with count');
+    assert.ok(design.attachments[0].blocks[0].text.text.endsWith('| 총 2건') && design.attachments[1].blocks[0].type === 'rich_text', 'header once, with count');
 
     events.push(ev('n', '새 일정', '2026-11-09T10:30', '2026-11-09T11:00'));
     env.run('onCalendarChanged');
@@ -583,7 +584,7 @@ const tests = {
     const latest = env.rawPosts('C1');
     assert.strictEqual(latest.length, 3);
     assert.strictEqual(latest[2].attachments.length, 1);
-    assert.ok(blocksText(latest[2].attachments[0].blocks)[0].includes('새 일정'));
+    assert.ok(blocksText(latest[2].attachments[0].blocks)[1].includes('새 일정'));
   },
 
   'weekday filter uses the event day, not the send day': () => {
@@ -626,7 +627,8 @@ const tests = {
     const [post] = env.rawPosts('C1');
     assert.strictEqual(env.rawPosts('C1').length, 1);
     assert.strictEqual(post.attachments.length, 2);
-    const byTitle = (t) => blocksText(post.attachments.find((a) => blocksText(a.blocks)[0].includes(t)).blocks);
+    // An event's lines inside its color bar, without the header line the first bar carries.
+    const byTitle = (t) => blocksText(post.attachments.find((a) => blocksText(a.blocks).join('\n').includes(t)).blocks).filter((line) => !line.startsWith('*일정 알림*'));
     const meeting = byTitle('공개 회의');
     assert.strictEqual(meeting[1], '회의실 &amp; 링크', 'description goes to the small gray line, not a quote');
     assert.strictEqual(byTitle('긴 설명')[1], `${'a'.repeat(299)}…`, 'the gray line is capped at 300 characters');
@@ -670,7 +672,7 @@ const tests = {
       '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건\n13:00 - 14:00 B 배포',
     ]);
     assert.deepStrictEqual(env.rawPosts('C1').map((p) => p.attachments.map((a) => a.color)), [['#4285F4', '#4285F4'], ['#E67C73']]);
-    assert.strictEqual(env.rawPosts('C1')[0].text, '디자인팀 · 오늘 요약 · 총 2건\n10:00 - 11:00 A 회의\n15:00 - 16:00 A 리뷰');
+    assert.strictEqual(env.rawPosts('C1')[0].attachments[0].fallback, '디자인팀 · 오늘 요약 · 총 2건\n10:00 - 11:00 A 회의\n15:00 - 16:00 A 리뷰');
     env.setNow('2026-11-09T09:05');
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 2, 'each calendar is sent once');
@@ -689,8 +691,8 @@ const tests = {
     const [raw] = env.rawPosts('C1');
     const [link] = linksOf(raw);
     assert.strictEqual(link.text, title);
-    assert.ok(!JSON.stringify(raw.attachments).includes('|'), 'no mrkdwn <url|title> links in the event lines');
-    assert.ok(raw.text.includes(title), 'the notification text keeps the title too');
+    assert.ok(!JSON.stringify(raw.attachments).includes('<http'), 'no mrkdwn <url|title> links anywhere');
+    assert.ok(raw.attachments[0].fallback.includes(title), 'the notification text keeps the title too');
   },
 
   'event titles link to the event, using the occurrence id for recurring events': () => {
@@ -1264,8 +1266,8 @@ const tests = {
     daily.setNow('2026-11-10T09:00');
     daily.run('dispatchDue');
     const [att] = daily.rawPosts('C1')[0].attachments;
-    assert.strictEqual(att.blocks[1].type, 'context', 'small gray line inside the color bar');
-    assert.strictEqual(blocksText(att.blocks)[1], '매주 화요일, 13회\n3층', 'repeat rule first, then the description');
+    assert.deepStrictEqual(att.blocks.map((b) => b.type), ['section', 'rich_text', 'context'], 'header, event, small gray line inside the color bar');
+    assert.strictEqual(blocksText(att.blocks)[2], '매주 화요일, 13회\n3층', 'repeat rule first, then the description');
     const reads = () => daily.state.apiCalls.filter((c) => c.get).length;
     const before = reads();
     daily.run('rebuildSchedule');

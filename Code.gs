@@ -502,21 +502,25 @@ function cleanDescription_(html) {
 /*
  * 메시지 모양:
  *
- *   오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건     ← 머리글: 메시지 본문 블록 (색 막대 없음)
+ *   ┃ 오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건   ← 머리글: 첫 색 막대 첨부의 첫 줄
  *   ┃ 종일 창립기념일                                    ← 일정: 색 막대 첨부 안의 rich_text 블록 (제목은 일정 링크)
  *   ┃ 12:00 - 15:00 주간 회의
  *   ┃ 매주 화요일                                        ← 반복 규칙·설명: 같은 첨부 안의 작은 회색 글씨(context)
  *
- * - 일정 줄을 mrkdwn 링크(<url|제목>)로 만들면 iOS 앱이 제목 안 이모지 앞 글자를 지워서, rich_text 링크를 씁니다.
- * - 첨부에 블록을 넣으면 pretext를 같이 쓸 수 없어(invalid_attachments) 머리글은 메시지 본문 블록에 둡니다.
- *   본문 블록은 메시지당 맨 위 한 곳이라, 하루 요약도 캘린더마다 메시지를 따로 보냅니다.
- * - 블록이 있으면 메시지 text는 본문에 보이지 않고 알림(잠금화면 등)에만 쓰입니다.
- * - 알림이 늦게 도착할 수 있어 "N분 후" 같은 표현은 쓰지 않습니다.
+ * iOS Slack 앱 때문에 이렇게 만듭니다(실제 기기에서 확인한 내용):
+ * - 일정 줄을 mrkdwn 링크(<url|제목>)로 만들면 제목 안 이모지 앞 글자가 지워져서, rich_text 링크를 씁니다.
+ * - 첨부에 블록을 넣으면 pretext를 같이 쓸 수 없고(invalid_attachments), 머리글만 있는 첨부는 빈 회색 줄이 남습니다.
+ * - 머리글을 메시지 본문 블록에 두면 슬랙 알림 탭이 그 블록(머리글)만 보여 줘 일정 제목이 빠집니다.
+ * 그래서 메시지 본문(text, blocks)은 비우고, 머리글을 첫 첨부 안에 넣습니다.
+ * 잠금화면과 알림 탭은 첫 첨부의 fallback(서식 없는 글자)을 보여 주므로 거기에 캘린더·일정 제목을 넣습니다.
+ * 알림이 늦게 도착할 수 있어 "N분 후" 같은 표현은 쓰지 않습니다.
  */
 
-/** 보낼 메시지 하나: { text: 알림 글자, blocks: [머리글], attachments: 색 막대 일정들 } */
+/** 보낼 메시지 하나: 첫 첨부의 맨 위에 머리글을 넣고, 그 첨부의 fallback을 알림 글자로 씁니다. */
 function eventMessage_(header, notify, attachments) {
-  return { text: notify, blocks: [section_(header)], attachments };
+  const [first, ...rest] = attachments;
+  const head = Object.assign({}, first, { fallback: notify, blocks: [section_(header)].concat(first.blocks) });
+  return { text: '', attachments: [head].concat(rest) };
 }
 
 /** 일정 알림 하나(연결 확인용): "일정 알림 | 캘린더 이름" */
@@ -1324,7 +1328,7 @@ function sendConnectionPreview_(chId, conn, calendar, userId) {
   const index = next.allDay ? Math.max(0, Math.round((kstDayStart_(now) - next.start) / DAY)) : 0;
   const day = next.allDay ? next.start + index * DAY : kstDayStart_(next.start);
   const message = reminderMessage_(conn, calendarColor_(calendar), next, day);
-  postEphemeral_(chId, userId, message.text, message.attachments, [section_(`${head}\n가장 가까운 일정:`)].concat(message.blocks));
+  postEphemeral_(chId, userId, `${head}\n가장 가까운 일정:`, message.attachments);
 }
 
 /** 일정이 있었던 가장 최근 지난 하루를 현재 설정 형식으로, 누른 관리자에게만 보여 줍니다. */
