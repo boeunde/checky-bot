@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.0.5
+ * checky-bot v1.1.4
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -20,6 +20,8 @@ const DAY = 24 * 60 * MINUTE;
 const SCHEDULE_AHEAD = 25 * MINUTE; // 일정 목록을 만들 때 앞으로 볼 범위
 const SCHEDULE_BEHIND = 10 * MINUTE; // 실행이 늦어져도 이 시간 안의 알림은 보냅니다.
 const SCHEDULE_CACHE_SECONDS = 30 * 60;
+// 알림 목록의 저장 형태가 바뀌면 이름을 바꿉니다. 예전 코드가 만든 목록을 새 코드가 읽지 않도록 하기 위해서입니다.
+const SCHEDULE_CACHE_KEY = 'schedule_v2';
 const SENT_KEEP = 40 * MINUTE;
 const REMINDER_GRACE = 5 * MINUTE; // 일정 시작 후 이 시간이 지나면 늦은 알림을 보내지 않습니다.
 const MESSAGE_ATTACHMENT_LIMIT = 50; // Slack 메시지 하나에 붙일 일정(첨부) 수 상한
@@ -118,7 +120,7 @@ function runDispatchDue_() {
   cache.put('dispatching', '1', 50);
   try {
     const failures = [];
-    const raw = cache.get('schedule');
+    const raw = cache.get(SCHEDULE_CACHE_KEY);
     let schedule;
     if (raw) {
       schedule = JSON.parse(raw);
@@ -137,7 +139,7 @@ function runDispatchDue_() {
       .sort((a, b) => a.at - b.at)
       .forEach((item) => {
         try {
-          postMessage_(item.channel, item.text, item.attachments);
+          postMessage_(item.channel, item.text, item.attachments, item.blocks);
           item.keys.forEach((key) => { sent[key] = item.at + SENT_KEEP; });
           saveJson_('SENT', sent);
         } catch (err) {
@@ -157,7 +159,7 @@ function runDispatchDue_() {
 }
 
 function invalidateSchedule_() {
-  CacheService.getScriptCache().remove('schedule');
+  CacheService.getScriptCache().remove(SCHEDULE_CACHE_KEY);
 }
 
 /** 캘린더마다 "변경 시 실행" 트리거를 맞춥니다. 만들 수 없는 캘린더는 10분 주기로만 반영됩니다. */
@@ -224,7 +226,7 @@ function rebuildSchedule_() {
 
   const schedule = { builtAt: now, items };
   try {
-    CacheService.getScriptCache().put('schedule', JSON.stringify(schedule), SCHEDULE_CACHE_SECONDS);
+    CacheService.getScriptCache().put(SCHEDULE_CACHE_KEY, JSON.stringify(schedule), SCHEDULE_CACHE_SECONDS);
   } catch (err) {
     failures.push(`알림 목록 저장 실패: ${err.message}`);
   }
@@ -251,7 +253,10 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
           key: `r|${conn.id}|${info.id}|${info.start}|${i}`,
           group: `r|${conn.id}|${at}|${day}`,
           order: day - 1, // 같은 메시지 안에서 종일 일정을 먼저 적습니다.
-          attachments: [reminderAttachment_(conn, color, info, day)],
+          header: `*일정 알림* | ${escapeSlack_(conn.calendarName)}`,
+          lead: '오늘',
+          notify: notifyLine_(conn, info),
+          attachment: eventAttachment_(color, info, day),
         });
       }
       return;
@@ -267,7 +272,10 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
       key: `r|${conn.id}|${info.id}|${info.start}`,
       group: `r|${conn.id}|${at}|${day}`,
       order: info.start,
-      attachments: [reminderAttachment_(conn, color, info, day)],
+      header: `*일정 알림* | ${escapeSlack_(conn.calendarName)}`,
+      lead: reminderLeadLabel_(r.offset),
+      notify: notifyLine_(conn, info),
+      attachment: eventAttachment_(color, info, day),
     });
   });
   return items;
@@ -275,7 +283,7 @@ function reminderItems_(conn, infos, from, to, onlyDay, color) {
 
 /**
  * 같은 채널·같은 연결·같은 시각의 일정 알림을 한 메시지로 묶습니다.
- * 머리글은 첫 일정에만 남깁니다. 보낸 기록은 일정마다 남기므로(keys),
+ * 머리글은 메시지 맨 위에 한 번만 둡니다. 보낸 기록은 일정마다 남기므로(keys),
  * 나중에 같은 시각에 일정이 추가돼도 이미 보낸 일정은 다시 보내지 않습니다.
  */
 function mergeItems_(items) {
@@ -302,19 +310,17 @@ function mergeItems_(items) {
     const parts = m.parts.sort((a, b) => a.order - b.order);
     for (let i = 0; i < parts.length; i += MESSAGE_ATTACHMENT_LIMIT) {
       const chunk = parts.slice(i, i + MESSAGE_ATTACHMENT_LIMIT);
-      const attachments = chunk.map((p, index) => {
-        const a = Object.assign({}, p.attachments[0]);
-        if (index > 0) delete a.pretext;
-        else if (a.pretext) a.pretext += ` | 총 ${parts.length}건`;
-        return a;
-      });
-      result.push({ at: m.at, channel: m.channel, text: m.text, attachments, keys: chunk.map((p) => p.key) });
+      // 머리글 끝에는 일정까지 남은 시간("15분 후")을 붙입니다. 시간 일정이 하나라도 있으면 그 시간을, 종일 일정만이면 "오늘"을 씁니다.
+      const timed = parts.find((p) => p.lead !== '오늘');
+      const lead = timed ? timed.lead : '오늘';
+      const message = eventMessage_(`${chunk[0].header} | ${lead}`, chunk.map((p) => p.notify).join('\n'), chunk.map((p) => p.attachment));
+      result.push(Object.assign({ at: m.at, channel: m.channel, keys: chunk.map((p) => p.key) }, message));
     }
   });
   return result;
 }
 
-/** 하루 요약. 같은 채널에서 같은 날 같은 시각에 보낼 캘린더는 한 메시지로 묶습니다. */
+/** 하루 요약. 같은 채널·같은 날·같은 시각에 보낼 캘린더를 모은 뒤, 캘린더마다 메시지 하나씩 만듭니다. */
 function dailyItems_(chId, entries, from, to) {
   const groups = {};
   entries.forEach((entry) => {
@@ -329,12 +335,17 @@ function dailyItems_(chId, entries, from, to) {
       groups[key].entries.push(entry);
     }
   });
-  return Object.keys(groups)
-    .map((key) => {
-      const g = groups[key];
-      return { at: g.at, key, attachments: dailyAttachments_(g.day, g.entries, g.at) };
-    })
-    .filter((item) => item.attachments);
+  // 캘린더마다 메시지를 따로 보내므로(머리글이 메시지당 하나) 보낸 기록도 캘린더마다 남깁니다.
+  const items = [];
+  Object.keys(groups).forEach((key) => {
+    const g = groups[key];
+    g.entries.forEach((entry) => {
+      dailyMessages_(g.day, [entry], g.at).forEach((message) => {
+        items.push(Object.assign({ at: g.at, key: `${key}|${entry.conn.id}` }, message));
+      });
+    });
+  });
+  return items;
 }
 
 // ─── 일정 읽기와 메시지 ───────────────────────────────────
@@ -494,29 +505,41 @@ function cleanDescription_(html) {
 }
 
 /*
- * 메시지 모양: 캘린더 이름 줄(머리글)은 색 막대 없이, 일정마다 캘린더 색 막대를 붙입니다.
+ * 메시지 모양:
  *
- *   오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건     ← 하루 요약 머리글 (막대 없음)
- *   일정 알림 | 디자인팀 | 총 1건                       ← 일정 알림 머리글
- *   ┃ 종일 창립기념일                                    ← 일정 (막대, 제목은 일정 링크)
+ *   ┃ 오늘 요약 | 11월 9일 월요일 | 디자인팀 | 총 2건   ← 머리글: 첫 색 막대 첨부의 첫 줄
+ *   ┃ 종일 창립기념일                                    ← 일정: 색 막대 첨부 안의 rich_text 블록 (제목은 일정 링크)
  *   ┃ 12:00 - 15:00 주간 회의
+ *   ┃ 매주 화요일                                        ← 반복 규칙·설명: 같은 첨부 안의 작은 회색 글씨(context)
  *
- * Slack 첨부의 pretext(막대 위 바깥 글자)에 머리글을 넣어 이 모양을 만듭니다.
- * 알림이 늦게 도착할 수 있어 "N분 후" 같은 표현은 쓰지 않습니다.
- * "총 n건"은 하루 요약은 여기서, 일정 알림은 한 메시지로 묶을 때(mergeItems_) 붙입니다.
+ * iOS Slack 앱 때문에 이렇게 만듭니다(실제 기기에서 확인한 내용):
+ * - 일정 줄을 mrkdwn 링크(<url|제목>)로 만들면 제목 안 이모지 앞 글자가 지워져서, rich_text 링크를 씁니다.
+ * - 첨부에 블록을 넣으면 pretext를 같이 쓸 수 없고(invalid_attachments), 머리글만 있는 첨부는 빈 회색 줄이 남습니다.
+ * - 머리글을 메시지 본문 블록에 두면 슬랙 알림 탭이 그 블록(머리글)만 보여 줘 일정 제목이 빠집니다.
+ * 그래서 메시지 본문(text, blocks)은 비우고, 머리글을 첫 첨부 안에 넣습니다.
+ * 잠금화면과 알림 탭은 첫 첨부의 fallback(서식 없는 글자)을 보여 주므로 거기에 캘린더·일정 제목을 넣습니다.
+ * 일정 알림 머리글의 "15분 후"는 설정한 알림 시점 기준입니다. 실행이 늦어지면 실제 남은 시간은 조금 짧을 수 있습니다.
  */
 
-/** 일정 알림 하나. "🔔 일정 알림 | 캘린더 이름" */
-function reminderAttachment_(conn, color, info, day) {
-  return eventAttachment_(conn, color, info, day, `*일정 알림* | ${escapeSlack_(conn.calendarName)}`);
+/** 보낼 메시지 하나: 첫 첨부의 맨 위에 머리글을 넣고, 그 첨부의 fallback을 알림 글자로 씁니다. */
+function eventMessage_(header, notify, attachments) {
+  const [first, ...rest] = attachments;
+  const head = Object.assign({}, first, { fallback: notify, blocks: [section_(header)].concat(first.blocks) });
+  return { text: '', attachments: [head].concat(rest) };
+}
+
+/** 일정 알림 하나(연결 확인용): "일정 알림 | 캘린더 이름" */
+function reminderMessage_(conn, color, info, day) {
+  const name = escapeSlack_(conn.calendarName);
+  return eventMessage_(`*일정 알림* | ${name}`, notifyLine_(conn, info), [eventAttachment_(color, info, day)]);
 }
 
 /**
- * 하루 요약. 같은 메시지에 캘린더별 머리글과 일정들이 이어집니다.
- * 보낼 내용이 하나도 없으면 null입니다. sendAt을 주면 그 시각 기준으로 "오늘"/"내일"을 붙입니다.
+ * 하루 요약. 캘린더마다 메시지 하나(머리글 + 일정들)를 만듭니다.
+ * 보낼 내용이 없으면 빈 배열입니다. sendAt을 주면 그 시각 기준으로 "오늘"/"내일"을 붙입니다.
  */
-function dailyAttachments_(day, entries, sendAt) {
-  const attachments = [];
+function dailyMessages_(day, entries, sendAt) {
+  const messages = [];
   entries.forEach((entry) => {
     const { conn, infos, color } = entry;
     const scope = conn.daily.scope;
@@ -525,17 +548,21 @@ function dailyAttachments_(day, entries, sendAt) {
       .filter((i) => (i.allDay ? i.start <= day && i.end > day : i.start >= day && i.start < day + DAY))
       .sort((a, b) => (a.allDay === b.allDay ? a.start - b.start : a.allDay ? -1 : 1));
     if (!items.length && conn.daily.empty !== 'send') return;
-    const header = `${dayHeader_(conn, day, `${relativeDay_(day, sendAt) || '하루'} 요약`)} | 총 ${items.length}건`;
-    if (!items.length) {
-      attachments.push(withColor_({ pretext: header, text: '일정 없음', fallback: `${conn.calendarName} 일정 없음`, mrkdwn_in: ['pretext', 'text'] }, color));
-      return;
+    const label = `${relativeDay_(day, sendAt) || '하루'} 요약`;
+    const header = `${dayHeader_(conn, day, label)} | 총 ${items.length}건`;
+    const notify = [`${escapeSlack_(conn.calendarName)} · ${label} · 총 ${items.length}건`]
+      .concat(items.map((info) => escapeSlack_(`${whenText_(info)} ${info.title}`)))
+      .join('\n');
+    let attachments = items.length
+      ? items.map((info) => eventAttachment_(color, info, day))
+      : [lineAttachment_(color, [{ text: '일정 없음' }])];
+    if (attachments.length > MESSAGE_ATTACHMENT_LIMIT) {
+      const rest = attachments.length - (MESSAGE_ATTACHMENT_LIMIT - 1);
+      attachments = attachments.slice(0, MESSAGE_ATTACHMENT_LIMIT - 1).concat(lineAttachment_(null, [{ text: `외 ${rest}건` }]));
     }
-    items.forEach((info, index) => attachments.push(eventAttachment_(conn, color, info, day, index === 0 ? header : undefined)));
+    messages.push(eventMessage_(header, notify, attachments));
   });
-  if (!attachments.length) return null;
-  if (attachments.length <= MESSAGE_ATTACHMENT_LIMIT) return attachments;
-  const rest = attachments.length - (MESSAGE_ATTACHMENT_LIMIT - 1);
-  return attachments.slice(0, MESSAGE_ATTACHMENT_LIMIT - 1).concat({ text: `외 ${rest}건`, fallback: `외 ${rest}건` });
+  return messages;
 }
 
 /** "오늘 요약 | 11월 9일 월요일 | 캘린더 이름" */
@@ -543,20 +570,40 @@ function dayHeader_(conn, day, label) {
   return `*${label}* | ${formatDayLong_(day)} | ${escapeSlack_(conn.calendarName)}`;
 }
 
-/** 일정 한 줄(+설명)에 캘린더 색 막대를 붙인 첨부. pretext는 막대 위에 막대 없이 표시됩니다. */
-function eventAttachment_(conn, color, info, day, pretext) {
+/** 일정 한 줄(+반복 규칙·설명)에 캘린더 색 막대를 붙인 첨부 */
+function eventAttachment_(color, info, day) {
   const index = info.allDay ? Math.round((day - info.start) / DAY) : 0;
-  const when = info.allDay ? '종일' : `${formatClock_(info.start)} - ${formatClock_(info.end)}`;
-  const title = escapeSlack_(info.title);
-  const linked = info.link ? `<${info.link}|${title}>` : title;
-  const line = `${when} ${linked}${info.allDay ? partLabel_(info, index) : ''}`;
-  const attachment = withDescription_({
-    text: line,
-    fallback: `${conn.calendarName} · ${when} ${info.title}`,
-    mrkdwn_in: ['pretext', 'text'],
-  }, info);
-  if (pretext) attachment.pretext = pretext;
-  return withColor_(attachment, color);
+  return lineAttachment_(color, [
+    { text: `${whenText_(info)} | ` },
+    { text: info.title, url: info.link },
+    { text: info.allDay ? partLabel_(info, index) : '' },
+  ], { footer: descriptionText_(info) });
+}
+
+/**
+ * 색 막대 첨부 하나: 글자 조각들을 rich_text 한 줄로 잇고(url이 있는 조각은 링크),
+ * footer가 있으면 그 아래 작은 회색 글씨로 붙입니다. strike면 줄 전체에 취소선을 긋습니다.
+ * rich_text 글자는 Slack 서식으로 읽지 않으므로 escapeSlack_를 하지 않습니다.
+ */
+function lineAttachment_(color, pieces, options) {
+  const opts = options || {};
+  const elements = pieces.filter((p) => p.text).map((p) => {
+    const el = p.url ? { type: 'link', url: p.url, text: p.text } : { type: 'text', text: p.text };
+    if (opts.strike) el.style = { strike: true };
+    return el;
+  });
+  const blocks = [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements }] }];
+  if (opts.footer) blocks.push(context_(opts.footer));
+  return withColor_({ fallback: pieces.map((p) => p.text || '').join(''), blocks }, color);
+}
+
+/** 알림(잠금화면 등)에 보이는 한 줄: "캘린더 · 14:00 - 15:00 제목" */
+function notifyLine_(conn, info) {
+  return escapeSlack_(`${conn.calendarName} · ${whenText_(info)} ${info.title}`);
+}
+
+function whenText_(info) {
+  return info.allDay ? '종일' : `${formatClock_(info.start)} - ${formatClock_(info.end)}`;
 }
 
 function withColor_(attachment, color) {
@@ -581,14 +628,12 @@ function calendarColor_(calendar) {
 }
 
 /**
- * 설명은 첨부의 footer(색 막대 안 아래쪽의 작은 회색 글씨)에 넣습니다.
- * 인용(>)을 쓰면 색 막대 안에 세로줄이 하나 더 생겨서 쓰지 않습니다. footer는 300자까지입니다.
+ * 반복 규칙("매주 화요일, 13회")과 설명. 색 막대 안 아래쪽의 작은 회색 글씨로 붙입니다.
+ * 인용(>)을 쓰면 색 막대 안에 세로줄이 하나 더 생겨서 쓰지 않습니다. 300자까지입니다.
  */
-function withDescription_(attachment, info) {
-  // 반복 규칙("매주 화요일, 13회")이 있으면 첫 줄에, 설명은 그 아래에 둡니다.
+function descriptionText_(info) {
   const text = [info.recurrence, info.description].filter(Boolean).map(escapeSlack_).join('\n');
-  if (text) attachment.footer = text.length > 300 ? `${text.slice(0, 299)}…` : text;
-  return attachment;
+  return text.length > 300 ? `${text.slice(0, 299)}…` : text;
 }
 
 function partLabel_(info, index) {
@@ -814,10 +859,11 @@ function postToday_(chId, userId, toChannel) {
     });
   });
   if (!entries.length) return '연결된 캘린더를 읽지 못했습니다. 공용 구글 계정에 캘린더가 공유돼 있는지 확인하세요.';
-  const attachments = dailyAttachments_(day, entries, now);
   try {
-    if (toChannel) postMessage_(chId, '', attachments);
-    else postEphemeral_(chId, userId, '', attachments);
+    dailyMessages_(day, entries, now).forEach((m) => {
+      if (toChannel) postMessage_(chId, m.text, m.attachments, m.blocks);
+      else postEphemeral_(chId, userId, m.text, m.attachments, m.blocks);
+    });
   } catch (err) {
     return `보내지 못했습니다: ${err.message}`;
   }
@@ -854,6 +900,9 @@ function handleInteraction_(payload) {
   if (payload.type === 'view_submission') return handleSubmission_(payload, userId);
   if (payload.type === 'message_action' && payload.callback_id === 'delete_message') {
     handleDeleteMessage_(payload, userId);
+  }
+  if (payload.type === 'message_action' && payload.callback_id === 'refresh_message') {
+    handleRefreshMessage_(payload, userId);
   }
   return null;
 }
@@ -1220,15 +1269,192 @@ function handleDeleteMessage_(payload, userId) {
     respond('이 채널의 관리자만 Checky Bot 메시지를 지울 수 있습니다.');
     return;
   }
-  const fromBot = message.user === botUserId_()
-    || (message.bot_profile && message.bot_profile.app_id === payload.api_app_id)
-    || (message.app_id && message.app_id === payload.api_app_id);
-  if (!fromBot) {
+  if (!isOwnMessage_(payload)) {
     respond('Checky Bot이 보낸 메시지만 지울 수 있습니다.');
     return;
   }
   // 실수로 지우지 않도록 확인 창을 먼저 띄웁니다. 삭제는 확인 창의 [삭제]를 눌러야 실행됩니다.
   slackApi_('views.open', { trigger_id: payload.trigger_id, view: deleteConfirmModal_(chId, message, payload.response_url) });
+}
+
+/** 메시지 단축키를 누른 메시지가 Checky Bot이 보낸 것인지 */
+function isOwnMessage_(payload) {
+  const message = payload.message || {};
+  return message.user === botUserId_()
+    || (message.bot_profile && message.bot_profile.app_id === payload.api_app_id)
+    || (message.app_id && message.app_id === payload.api_app_id);
+}
+
+/**
+ * 메시지 ⋯ > "Checky Bot 메시지 새 형식으로"(callback ID: refresh_message). 그 채널 관리자만 쓸 수 있습니다.
+ * 예전 형식으로 보낸 일정 메시지를 지금 형식으로 고칩니다.
+ *   - v1.1.0 전: 머리글 pretext + mrkdwn <링크|제목>
+ *   - v1.1.0: 머리글이 메시지 본문 블록(색 막대 밖), 알림 글자가 message.text, 일정 줄에 | 구분 없음
+ * 새로 보내지 않고 같은 메시지를 수정하므로 알림은 다시 가지 않습니다.
+ */
+function handleRefreshMessage_(payload, userId) {
+  const chId = payload.channel.id;
+  const message = payload.message || {};
+  const respond = (text) => respondEphemeral_(payload.response_url, text);
+  if (!isAdmin_(loadChannel_(chId), userId)) {
+    respond('이 채널의 관리자만 Checky Bot 메시지를 고칠 수 있습니다.');
+    return;
+  }
+  if (!isOwnMessage_(payload)) {
+    respond('Checky Bot이 보낸 메시지만 고칠 수 있습니다.');
+    return;
+  }
+  const attachments = message.attachments || [];
+  if (!attachments.length) {
+    respond('이미 새 형식이거나, 고칠 일정 메시지가 아닙니다.');
+    return;
+  }
+  // 예전 형식 첨부는 새로 만들고, 블록 첨부는 일정 줄에 | 구분을 넣고 글자로 남은 ":이모지 이름:"을 이모지로 바꿉니다.
+  const fixed = attachments.map((a) => (a.blocks
+    ? { color: slackColor_(a.color), fallback: a.fallback || '', blocks: a.blocks.map(withSeparatorBlock_).map(withEmojiBlock_) }
+    : legacyAttachment_(a)));
+  // v1.1.0의 본문 블록 머리글은 첫 색 막대 안으로 옮기고, 알림 글자(message.text)는 첫 첨부의 fallback으로 옮깁니다.
+  const topHeaders = (message.blocks || []).filter((b) => b.type === 'section' && b.text).map((b) => b.text.text);
+  if (topHeaders.length) {
+    fixed[0].blocks = topHeaders.map(section_).concat(fixed[0].blocks);
+    if (message.text) fixed[0].fallback = message.text;
+  }
+  // v1.1.3 전 일정 알림 머리글의 "총 n건"은 일정까지 남은 시간("15분 후")으로 바꿉니다.
+  const lead = sentReminderLead_(fixed, message.ts);
+  if (lead) {
+    fixed.forEach((a) => {
+      a.blocks = a.blocks.map((b) => (b.type === 'section' && b.text && REMINDER_COUNT_HEADER.test(b.text.text)
+        ? section_(b.text.text.replace(REMINDER_COUNT_HEADER, `$1 | ${lead}`))
+        : b));
+    });
+  }
+  const unchanged = !topHeaders.length && attachments.every((a, i) => a.blocks && JSON.stringify(a.blocks) === JSON.stringify(fixed[i].blocks));
+  if (unchanged) {
+    respond('이미 새 형식이거나, 고칠 일정 메시지가 아닙니다.');
+    return;
+  }
+  const params = { channel: chId, ts: message.ts, text: topHeaders.length ? '' : message.text || '', attachments: fixed };
+  if (message.blocks && message.blocks.length) params.blocks = []; // 빈 배열을 보내야 본문 블록이 지워집니다.
+  try {
+    slackApi_('chat.update', params);
+  } catch (err) {
+    respond(`메시지를 고치지 못했습니다: ${err.message}`);
+    return;
+  }
+  respond('메시지를 새 형식으로 고쳤습니다.');
+}
+
+/** 예전 형식 첨부 하나 → 지금 형식(머리글은 막대 안 첫 줄, 일정 줄은 rich_text, 설명은 작은 회색 줄) */
+function legacyAttachment_(a) {
+  const { pieces, strike } = legacyLine_(a.text || '');
+  const attachment = lineAttachment_(slackColor_(a.color), pieces, { strike, footer: a.footer || '' });
+  attachment.blocks = attachment.blocks.map(withEmojiBlock_);
+  if (a.pretext) attachment.blocks.unshift(section_(a.pretext));
+  if (a.fallback) attachment.fallback = a.fallback;
+  return attachment;
+}
+
+/** Slack이 돌려주는 색은 "4285F4"처럼 #이 없습니다. */
+function slackColor_(color) {
+  return color ? `#${String(color).replace(/^#/, '')}` : null;
+}
+
+/**
+ * Slack이 돌려주는 메시지 내용에서 이모지는 그림 문자가 아니라 ":hourglass:" 같은 이름입니다.
+ * mrkdwn에서는 그림으로 보이지만 rich_text에서는 글자 그대로 보여서, rich_text 이모지 요소로 바꿉니다.
+ * 링크 글자 안에는 이모지 요소를 넣을 수 없어 링크를 이모지 앞뒤로 나눕니다(같은 주소).
+ * 이름에 영문자가 하나는 있어야 이모지로 봅니다("10:30:00" 같은 시각은 그대로).
+ */
+const EMOJI_NAME = /:([a-z0-9_+'-]*[a-z][a-z0-9_+'-]*):(?::skin-tone-([2-6]):)?/;
+
+function withEmojiBlock_(block) {
+  if (!block || block.type !== 'rich_text') return block;
+  return Object.assign({}, block, {
+    elements: (block.elements || []).map((section) => Object.assign({}, section, {
+      elements: (section.elements || []).flatMap(emojiElements_),
+    })),
+  });
+}
+
+function emojiElements_(el) {
+  if ((el.type !== 'text' && el.type !== 'link') || !el.text || !EMOJI_NAME.test(el.text)) return [el];
+  const re = new RegExp(EMOJI_NAME.source, 'g');
+  const out = [];
+  let last = 0;
+  let m;
+  while ((m = re.exec(el.text))) {
+    if (m.index > last) out.push(Object.assign({}, el, { text: el.text.slice(last, m.index) }));
+    const emoji = { type: 'emoji', name: m[1] };
+    if (m[2]) emoji.skin_tone = Number(m[2]);
+    out.push(emoji);
+    last = re.lastIndex;
+  }
+  if (last < el.text.length) out.push(Object.assign({}, el, { text: el.text.slice(last) }));
+  return out;
+}
+
+/**
+ * 예전 일정 줄 "~11월 12일 (목) 14:00 - 15:00 <url|제목> (1/2)~"을 조각으로 나눕니다.
+ * 날짜·시간·제목 사이에는 지금 형식처럼 " | "를 넣습니다. 알아볼 수 없는 줄("일정 없음" 등)은 그대로 둡니다.
+ */
+function legacyLine_(text) {
+  let s = String(text);
+  const strike = s.length > 1 && s.startsWith('~') && s.endsWith('~');
+  if (strike) s = s.slice(1, -1);
+  const unescape = (t) => t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  const linked = s.match(new RegExp(`^${OLD_WHEN}<([^|>]+)\\|([^>]*)>([\\s\\S]*)$`));
+  const plain = linked ? null : s.match(new RegExp(`^${OLD_WHEN}([\\s\\S]+)$`));
+  const m = linked || plain;
+  if (!m) return { pieces: [{ text: unescape(s) }], strike };
+  const head = whenHead_(m[1], m[2]);
+  if (linked) return { pieces: [{ text: head }, { text: unescape(m[4]), url: m[3] }, { text: unescape(m[5]) }], strike };
+  return { pieces: [{ text: head }, { text: unescape(m[3]) }], strike };
+}
+
+const REMINDER_COUNT_HEADER = /^(\*일정 알림\* \| .+) \| 총 \d+건$/;
+
+/**
+ * 이미 보낸 일정 알림의 남은 시간: 메시지를 보낸 시각(ts)과 첫 일정 줄의 시작 시각을 비교해
+ * 알림 시점 선택지(지금·5분·15분·30분·1시간) 중 가장 가까운 것으로 정합니다. 종일 일정이면 "오늘".
+ * 일정 알림 머리글("총 n건")이 아니면 null입니다.
+ */
+function sentReminderLead_(attachments, ts) {
+  const blocks = attachments.flatMap((a) => a.blocks || []);
+  if (!blocks.some((b) => b.type === 'section' && b.text && REMINDER_COUNT_HEADER.test(b.text.text))) return null;
+  const line = blocks.find((b) => b.type === 'rich_text');
+  const first = line && line.elements[0] && (line.elements[0].elements || [])[0];
+  const text = (first && first.text) || '';
+  if (/^종일/.test(text)) return '오늘';
+  const m = text.match(/^(\d\d):(\d\d) - /);
+  if (!m) return null;
+  const sentAt = Math.round(Number(ts) * 1000);
+  let diff = Number(m[1]) * 60 + Number(m[2]) - kstParts_(sentAt).minutes;
+  if (diff < -12 * 60) diff += 24 * 60; // 자정을 넘긴 경우(23:30에 보낸 00:30 일정)
+  const offset = REMINDER_OFFSETS.reduce((best, o) => (Math.abs(o - diff) < Math.abs(best - diff) ? o : best));
+  return reminderLeadLabel_(offset);
+}
+
+// 예전 일정 줄의 앞부분: "(날짜 )시간 ". 날짜는 변경 알림에만, 여러 날 일정이면 "11월 10일 (화) - 11월 12일 (목)".
+const OLD_WHEN = '((?:\\d+월 \\d+일 \\([^)]\\)(?: - \\d+월 \\d+일 \\([^)]\\))? )?)(종일|\\d\\d:\\d\\d - \\d\\d:\\d\\d) ';
+
+/** 지금 형식의 앞부분: "11월 12일 (목) | 14:00 - 15:00 | " */
+function whenHead_(date, when) {
+  const d = String(date || '').trim();
+  return `${d ? `${d} | ` : ''}${when} | `;
+}
+
+/** v1.1.0 일정 줄(rich_text)의 앞 글자 "11월 12일 (목) 14:00 - 15:00 "에 | 구분을 넣습니다. */
+function withSeparatorBlock_(block) {
+  if (!block || block.type !== 'rich_text') return block;
+  const re = new RegExp(`^${OLD_WHEN}$`);
+  return Object.assign({}, block, {
+    elements: (block.elements || []).map((section) => {
+      const [first, ...rest] = section.elements || [];
+      const m = first && first.type === 'text' && first.text.match(re);
+      if (!m) return section;
+      return Object.assign({}, section, { elements: [Object.assign({}, first, { text: whenHead_(m[1], m[2]) })].concat(rest) });
+    }),
+  });
 }
 
 function submitDeleteMessage_(meta, userId) {
@@ -1286,13 +1512,14 @@ function sendConnectionPreview_(chId, conn, calendar, userId) {
   }
   const index = next.allDay ? Math.max(0, Math.round((kstDayStart_(now) - next.start) / DAY)) : 0;
   const day = next.allDay ? next.start + index * DAY : kstDayStart_(next.start);
-  postEphemeral_(chId, userId, `${head}\n가장 가까운 일정:`, [reminderAttachment_(conn, calendarColor_(calendar), next, day)]);
+  const message = reminderMessage_(conn, calendarColor_(calendar), next, day);
+  postEphemeral_(chId, userId, `${head}\n가장 가까운 일정:`, message.attachments);
 }
 
 /** 일정이 있었던 가장 최근 지난 하루를 현재 설정 형식으로, 누른 관리자에게만 보여 줍니다. */
 function runTest_(chId, conn, userId) {
   // 실제 알림과 같은 모양으로 보냅니다. 나에게만 보이는 메시지라 "[테스트]" 같은 표시는 붙이지 않습니다.
-  const say = (text, attachments) => postEphemeral_(chId, userId, text, attachments);
+  const say = (text, attachments, blocks) => postEphemeral_(chId, userId, text, attachments, blocks);
   const name = escapeSlack_(conn.calendarName);
   const calendar = openCalendar_(conn.calendarId);
   if (!calendar) {
@@ -1318,18 +1545,17 @@ function runTest_(chId, conn, userId) {
   const color = calendarColor_(calendar);
   const messages = [];
   if (conn.daily.enabled) {
-    const attachments = dailyAttachments_(day, [{ conn, infos, color }]);
-    messages.push(attachments
-      ? { routine: '하루 요약', text: '', attachments }
-      : { routine: '하루 요약', text: `${formatDay_(day)}에는 하루 요약 범위(${DAILY_SCOPES[conn.daily.scope]})에 맞는 일정이 없어 보내지 않습니다.` });
+    const daily = dailyMessages_(day, [{ conn, infos, color }]);
+    if (daily.length) daily.forEach((m) => messages.push(m));
+    else messages.push({ text: `${formatDay_(day)}에는 하루 요약 범위(${DAILY_SCOPES[conn.daily.scope]})에 맞는 일정이 없어 보내지 않습니다.` });
   }
   if (conn.reminder.enabled) {
     mergeItems_(reminderItems_(conn, infos, -Infinity, Infinity, day, color))
       .sort((a, b) => a.at - b.at)
-      .forEach((item) => messages.push({ routine: '일정 알림', text: '', attachments: item.attachments }));
+      .forEach((item) => messages.push(item));
   }
   say(`*${name}*, *${formatDay_(day)}* 에 등록된 일정입니다.`);
-  messages.slice(0, TEST_MESSAGE_LIMIT).forEach((m) => say(m.text, m.attachments));
+  messages.slice(0, TEST_MESSAGE_LIMIT).forEach((m) => say(m.text, m.attachments, m.blocks));
   if (messages.length > TEST_MESSAGE_LIMIT) say(`외 ${messages.length - TEST_MESSAGE_LIMIT}건은 생략했습니다.`);
 }
 
@@ -1661,7 +1887,8 @@ function dispatchChanges_(now) {
     const { chId, conn, kind } = p;
     if (!(conn.calendarId in colors)) colors[conn.calendarId] = calendarColor_(openCalendar_(conn.calendarId));
     try {
-      postMessage_(chId, '', [changeMessage_(conn, colors[conn.calendarId], kind, p.info)]);
+      const message = changeMessage_(conn, colors[conn.calendarId], kind, p.info);
+      postMessage_(chId, message.text, message.attachments, message.blocks);
     } catch (err) {
       failures.push(`${chId}: ${err.message}`);
       handleSendFailure_(chId, err);
@@ -1672,30 +1899,28 @@ function dispatchChanges_(now) {
 
 /** "일정 등록 | 캘린더" 머리글 + 일정 한 줄(색 막대) */
 function changeMessage_(conn, color, kind, info) {
-  const attachment = changeAttachment_(conn, color, kind, info);
-  attachment.pretext = `*일정 ${CHANGE_KINDS[kind]}* | ${escapeSlack_(conn.calendarName)}`;
-  return attachment;
+  const label = `일정 ${CHANGE_KINDS[kind]}`;
+  const name = escapeSlack_(conn.calendarName);
+  return eventMessage_(`*${label}* | ${name}`, escapeSlack_(`${conn.calendarName} · ${label} · ${info.title}`), [changeAttachment_(color, kind, info)]);
 }
 
-function changeAttachment_(conn, color, kind, info) {
+function changeAttachment_(color, kind, info) {
+  const deleted = kind === 'deleted';
   const lastDay = info.allDay ? info.end - DAY : info.start;
   let date = formatDay_(info.start);
   if (info.allDay && kstDayStart_(lastDay) > kstDayStart_(info.start)) date += ` - ${formatDay_(lastDay)}`;
   // 삭제된 반복 일정은 저장해 둔 날짜가 첫 회차라 날짜를 빼고 시간만 보여 줍니다.
-  if (kind === 'deleted' && info.recurring) date = '';
-  const when = info.allDay ? '종일' : `${formatClock_(info.start)} - ${formatClock_(info.end)}`;
-  const title = escapeSlack_(info.title);
-  const linked = info.link && kind !== 'deleted' ? `<${info.link}|${title}>` : title;
-  // 반복 규칙 문장(작은 회색 줄)을 만들지 못했을 때만 제목 뒤에 "(반복)"을 붙입니다.
-  const line = `${date ? `${date} ` : ''}${when} ${linked}${info.recurring && !info.recurrence ? ' (반복)' : ''}`;
-  const attachment = {
-    // 삭제된 일정은 날짜·시간·제목 줄 전체에 취소선을 긋습니다.
-    text: kind === 'deleted' ? `~${line}~` : line,
-    fallback: `${conn.calendarName} · 일정 ${CHANGE_KINDS[kind]} · ${info.title}`,
-    mrkdwn_in: ['pretext', 'text'],
-  };
-  // 삭제 알림에는 설명 없이 반복 규칙만 작은 회색 줄로 남깁니다.
-  return withColor_(withDescription_(attachment, kind === 'deleted' ? { recurrence: info.recurrence } : info), color);
+  if (deleted && info.recurring) date = '';
+  return lineAttachment_(color, [
+    // "11월 11일 (수) | 16:10 - 20:10 | 제목": 날짜·시간·제목을 | 로 나눠 읽기 쉽게 합니다.
+    { text: `${date ? `${date} | ` : ''}${whenText_(info)} | ` },
+    { text: info.title, url: deleted ? null : info.link }, // 삭제된 일정은 링크가 없습니다.
+    // 반복 규칙 문장(작은 회색 줄)을 만들지 못했을 때만 제목 뒤에 "(반복)"을 붙입니다.
+    { text: info.recurring && !info.recurrence ? ' (반복)' : '' },
+  ], {
+    strike: deleted, // 삭제된 일정은 날짜·시간·제목 줄 전체에 취소선을 긋습니다.
+    footer: descriptionText_(deleted ? { recurrence: info.recurrence } : info), // 삭제 알림에는 반복 규칙만 남깁니다.
+  });
 }
 
 function calendarStateKey_(calendarId) {
@@ -2036,13 +2261,14 @@ function slackApi_(method, params) {
 }
 
 /** 채널 ID 대신 사용자 ID를 주면 그 사람에게 DM으로 갑니다. */
-function postMessage_(channel, text, attachments) {
-  return slackApi_('chat.postMessage', { channel, text, attachments, unfurl_links: false, unfurl_media: false });
+/** blocks가 있으면 text는 본문에 보이지 않고 알림에만 쓰입니다. */
+function postMessage_(channel, text, attachments, blocks) {
+  return slackApi_('chat.postMessage', { channel, text, blocks, attachments, unfurl_links: false, unfurl_media: false });
 }
 
-function postEphemeral_(channel, user, text, attachments) {
+function postEphemeral_(channel, user, text, attachments, blocks) {
   try {
-    slackApi_('chat.postEphemeral', { channel, user, text, attachments });
+    slackApi_('chat.postEphemeral', { channel, user, text, blocks, attachments });
   } catch (err) {
     console.error(`나에게만 보이는 메시지를 보내지 못했습니다: ${err.message}`);
   }
@@ -2169,6 +2395,13 @@ function describeDays_(days) {
   if (sorted.length === 7) return '매일';
   if (sorted.join() === WEEKDAYS.join()) return '월-금';
   return sorted.map((d) => DAY_NAMES[d]).join(', ');
+}
+
+/** 일정 알림 머리글 끝: 알림 시점(분 전) → "지금", "5분 후", "1시간 후" */
+function reminderLeadLabel_(offset) {
+  if (!offset) return '지금';
+  if (offset % 60 === 0) return `${offset / 60}시간 후`;
+  return `${offset}분 후`;
 }
 
 function offsetChoiceLabel_(offset) {
@@ -2536,10 +2769,21 @@ function deleteConfirmModal_(chId, message, responseUrl) {
 
 /** 확인 창에 보여 줄 메시지 내용. 너무 길면 앞부분만 보여 줍니다. */
 function messagePreview_(message) {
-  const parts = [message.text || ''];
+  const parts = [];
+  // 블록이 있으면 본문은 블록이고 text는 알림용이라, 블록에서 글자를 모읍니다.
+  const fromBlocks = (blocks) => (blocks || []).forEach((b) => {
+    if (b.type === 'section' && b.text) parts.push(b.text.text);
+    if (b.type === 'context') parts.push((b.elements || []).map((e) => e.text || '').join(' '));
+    if (b.type === 'rich_text') {
+      parts.push((b.elements || []).map((s) => (s.elements || []).map((e) => escapeSlack_(e.text || '')).join('')).join('\n'));
+    }
+  });
+  if (message.blocks && message.blocks.length) fromBlocks(message.blocks);
+  else parts.push(message.text || '');
   (message.attachments || []).forEach((a) => {
     if (a.pretext) parts.push(a.pretext);
     if (a.text) parts.push(a.text);
+    fromBlocks(a.blocks);
   });
   const text = parts.join('\n').trim() || '(내용 없음)';
   return text.length > 300 ? `${text.slice(0, 300)}…` : text;
