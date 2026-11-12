@@ -32,7 +32,7 @@ Slack Google Calendar 앱이 채널에 보낸 공지 원문입니다.
 4. 이어서 나오는 알림 설정 화면의 **알림 유형**에서 **📅 하루 요약**, **🔔 일정 알림**, **✏️ 변경 알림**(일정 등록/변경/삭제)을 정합니다. 새 연결은 하루 요약만 켜져 있습니다. 변경 알림은 **+ 세트 추가**로 등록·변경·삭제마다 요일과 발송 시점을 따로 정할 수 있습니다(최대 3세트).
 5. 오늘 일정은 언제든 명령어로 볼 수 있습니다. `/checky today`는 나에게만 보이게, `/checky today-all`은 채널에 보냅니다(채널봇 관리자만). 하루 요약 설정과 관계없이 오늘의 모든 일정을 보여 줍니다.
 
-채널 설정 화면은 봇 프로필의 **[메시지] > 홈** 탭에서 채널 옆 **[설정]** 버튼으로도 열 수 있습니다. 채널 설정 화면에서는 **관리자 변경**과 연결별 **연결상태 테스트 / 일시정지 / 캘린더 바꾸기 / ⚙️ 설정**을 할 수 있고, 캘린더 이름 옆 **[⋯] > 연결 끊기**로 연결을 끊습니다. 봇 메시지는 메시지의 `⋯` 메뉴 > **Checky Bot 메시지 삭제**로 지웁니다. 모두 그 채널의 채널 봇 관리자만 할 수 있습니다.
+채널 설정 화면은 봇 프로필의 **[메시지] > 홈** 탭에서 채널 옆 **[설정]** 버튼으로도 열 수 있습니다. 채널 설정 화면에서는 **관리자 변경**과 연결별 **연결상태 테스트 / 일시정지 / 캘린더 바꾸기 / ⚙️ 설정**을 할 수 있고, 캘린더 이름 옆 **[⋯] > 연결 끊기**로 연결을 끊습니다. 봇 메시지는 메시지의 `⋯` 메뉴 > **Checky Bot 메시지 삭제**로 지우고, **Checky Bot 메시지 새 형식으로**로 예전 형식의 알림을 지금 형식으로 고칩니다. 모두 그 채널의 채널 봇 관리자만 할 수 있습니다.
 
 ## 설치
 
@@ -56,7 +56,7 @@ https://api.slack.com/apps 에서 앱을 새로 만듭니다(**Create New App > 
    | 권한 | 쓰는 곳 |
    |---|---|
    | `commands` | `/checky` 명령어 |
-   | `chat:write` | 알림, 나에게만 보이는 메시지, 앱 설치자 DM, 메시지 삭제 |
+   | `chat:write` | 알림, 나에게만 보이는 메시지, 앱 설치자 DM, 메시지 삭제·새 형식으로 고치기 |
    | `users:read` | 게스트·봇 계정 확인 |
    | `channels:read` | 공개 채널 초대·내보내기 감지 |
    | `groups:read` | 비공개 채널 초대·내보내기 감지 |
@@ -89,7 +89,7 @@ Slack이 보내는 명령어와 버튼 요청을 받으려면 배포가 필요�
 | 메뉴 | 설정 |
 |---|---|
 | **Slash Commands** | **Create New Command**: Command `/checky`, Request URL은 웹 앱 URL, Short Description `캘린더 알림 설정` |
-| **Interactivity & Shortcuts** | 켜고 Request URL에 웹 앱 URL. **Create New Shortcut > On messages**: Name `Checky Bot 메시지 삭제`, Callback ID `delete_message` |
+| **Interactivity & Shortcuts** | 켜고 Request URL에 웹 앱 URL. **Create New Shortcut > On messages**로 두 개를 만듭니다: Name `Checky Bot 메시지 삭제` / Callback ID `delete_message`, Name `Checky Bot 메시지 새 형식으로` / Callback ID `refresh_message` |
 | **Event Subscriptions** | 켜고 Request URL에 웹 앱 URL(Verified 표시 확인). **Subscribe to bot events**에 `app_home_opened`, `member_joined_channel`, `channel_left`, `group_left` 추가 |
 | **App Home** | **Home Tab**과 **Messages Tab**을 켭니다. Messages Tab이 꺼져 있으면 앱 설치자 DM이 보이지 않습니다. |
 
@@ -113,6 +113,8 @@ Slack 왼쪽 앱 목록에서 Checky Bot을 열면(App Home) 처음 연 사람�
 ## 코드를 고친 뒤
 
 웹 앱은 배포한 시점의 코드로 돌아갑니다. 코드를 고치면 **배포 > 배포 관리 > 편집(연필) > 버전: 새 버전 > 배포**를 누르세요. URL은 그대로 유지됩니다. 자동 실행(1분·10분 주기)은 배포와 관계없이 저장된 최신 코드로 돕니다.
+
+메시지 형식이 바뀐 버전으로 올렸다면, 이미 보낸 알림은 메시지의 `⋯` 메뉴 > **Checky Bot 메시지 새 형식으로**로 지금 형식으로 고칠 수 있습니다. 같은 메시지가 수정되며 알림은 다시 가지 않습니다. 예를 들어 v1.1.0 전 알림은 iOS 앱에서 이모지가 든 일정 제목이 잘려 보이는데, 이렇게 고치면 제대로 보입니다.
 
 ## 동작 방식
 

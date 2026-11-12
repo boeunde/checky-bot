@@ -896,6 +896,9 @@ function handleInteraction_(payload) {
   if (payload.type === 'message_action' && payload.callback_id === 'delete_message') {
     handleDeleteMessage_(payload, userId);
   }
+  if (payload.type === 'message_action' && payload.callback_id === 'refresh_message') {
+    handleRefreshMessage_(payload, userId);
+  }
   return null;
 }
 
@@ -1261,15 +1264,82 @@ function handleDeleteMessage_(payload, userId) {
     respond('이 채널의 관리자만 Checky Bot 메시지를 지울 수 있습니다.');
     return;
   }
-  const fromBot = message.user === botUserId_()
-    || (message.bot_profile && message.bot_profile.app_id === payload.api_app_id)
-    || (message.app_id && message.app_id === payload.api_app_id);
-  if (!fromBot) {
+  if (!isOwnMessage_(payload)) {
     respond('Checky Bot이 보낸 메시지만 지울 수 있습니다.');
     return;
   }
   // 실수로 지우지 않도록 확인 창을 먼저 띄웁니다. 삭제는 확인 창의 [삭제]를 눌러야 실행됩니다.
   slackApi_('views.open', { trigger_id: payload.trigger_id, view: deleteConfirmModal_(chId, message, payload.response_url) });
+}
+
+/** 메시지 단축키를 누른 메시지가 Checky Bot이 보낸 것인지 */
+function isOwnMessage_(payload) {
+  const message = payload.message || {};
+  return message.user === botUserId_()
+    || (message.bot_profile && message.bot_profile.app_id === payload.api_app_id)
+    || (message.app_id && message.app_id === payload.api_app_id);
+}
+
+/**
+ * 메시지 ⋯ > "Checky Bot 메시지 새 형식으로"(callback ID: refresh_message). 그 채널 관리자만 쓸 수 있습니다.
+ * v1.1.0 전 형식(머리글 pretext + mrkdwn <링크|제목>)으로 보낸 일정 메시지를 지금 형식으로 고칩니다.
+ * 새로 보내지 않고 같은 메시지를 수정하므로 알림은 다시 가지 않습니다.
+ */
+function handleRefreshMessage_(payload, userId) {
+  const chId = payload.channel.id;
+  const message = payload.message || {};
+  const respond = (text) => respondEphemeral_(payload.response_url, text);
+  if (!isAdmin_(loadChannel_(chId), userId)) {
+    respond('이 채널의 관리자만 Checky Bot 메시지를 고칠 수 있습니다.');
+    return;
+  }
+  if (!isOwnMessage_(payload)) {
+    respond('Checky Bot이 보낸 메시지만 고칠 수 있습니다.');
+    return;
+  }
+  const attachments = message.attachments || [];
+  if (!attachments.length || attachments.some((a) => a.blocks)) {
+    respond('이미 새 형식이거나, 고칠 일정 메시지가 아닙니다.');
+    return;
+  }
+  try {
+    slackApi_('chat.update', { channel: chId, ts: message.ts, text: message.text || '', attachments: attachments.map(legacyAttachment_) });
+  } catch (err) {
+    respond(`메시지를 고치지 못했습니다: ${err.message}`);
+    return;
+  }
+  respond('메시지를 새 형식으로 고쳤습니다.');
+}
+
+/** 예전 형식 첨부 하나 → 지금 형식(머리글은 막대 안 첫 줄, 일정 줄은 rich_text, 설명은 작은 회색 줄) */
+function legacyAttachment_(a) {
+  const { pieces, strike } = legacyLine_(a.text || '');
+  // Slack이 돌려주는 색은 "4285F4"처럼 #이 없습니다.
+  const color = a.color ? `#${String(a.color).replace(/^#/, '')}` : null;
+  const attachment = lineAttachment_(color, pieces, { strike, footer: a.footer || '' });
+  if (a.pretext) attachment.blocks.unshift(section_(a.pretext));
+  if (a.fallback) attachment.fallback = a.fallback;
+  return attachment;
+}
+
+/**
+ * 예전 일정 줄 "~11월 12일 (목) 14:00 - 15:00 <url|제목> (1/2)~"을 조각으로 나눕니다.
+ * 날짜·시간·제목 사이에는 지금 형식처럼 " | "를 넣습니다. 알아볼 수 없는 줄("일정 없음" 등)은 그대로 둡니다.
+ */
+function legacyLine_(text) {
+  let s = String(text);
+  const strike = s.length > 1 && s.startsWith('~') && s.endsWith('~');
+  if (strike) s = s.slice(1, -1);
+  const unescape = (t) => t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  const when = '((?:\\d+월 \\d+일 \\([^)]\\)(?: - \\d+월 \\d+일 \\([^)]\\))? )?)(종일|\\d\\d:\\d\\d - \\d\\d:\\d\\d) ';
+  const linked = s.match(new RegExp(`^${when}<([^|>]+)\\|([^>]*)>([\\s\\S]*)$`));
+  const plain = linked ? null : s.match(new RegExp(`^${when}([\\s\\S]+)$`));
+  const m = linked || plain;
+  if (!m) return { pieces: [{ text: unescape(s) }], strike };
+  const date = m[1].trim();
+  const head = `${date ? `${date} | ` : ''}${m[2]} | `;
+  if (linked) return { pieces: [{ text: head }, { text: unescape(m[4]), url: m[3] }, { text: unescape(m[5]) }], strike };
+  return { pieces: [{ text: head }, { text: unescape(m[3]) }], strike };
 }
 
 function submitDeleteMessage_(meta, userId) {

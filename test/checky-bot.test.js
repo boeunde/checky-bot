@@ -695,6 +695,50 @@ const tests = {
     assert.ok(raw.attachments[0].fallback.includes(title), 'the notification text keeps the title too');
   },
 
+  'the "새 형식으로" shortcut rewrites an old-format bot message in place (admins only)': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    const shortcut = (user, message) => env.interact({ type: 'message_action', callback_id: 'refresh_message', user: { id: user }, channel: { id: 'C1' }, message, response_url: 'https://hooks.slack.com/actions/r', api_app_id: 'A1' });
+    const said = () => env.state.responses.at(-1).body.text;
+    const title = '박보은🌓반차/오후';
+    const old = {
+      user: 'UBOT', ts: '5.0', text: '',
+      attachments: [
+        { pretext: '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', text: `종일 <https://cal/e1|${title}> (1/2)`, footer: '매주 화요일, 13회', color: '4285F4', fallback: `디자인팀 · 종일 ${title}` },
+        { text: '14:00 - 15:00 <https://cal/e2|A &amp; B 회의>', color: '4285F4', fallback: '디자인팀 · 14:00 - 15:00 A & B 회의' },
+        { pretext: '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건', text: '일정 없음', color: 'E67C73', fallback: '개발팀 일정 없음' },
+      ],
+    };
+    const deleted = { user: 'UBOT', ts: '6.0', text: '', attachments: [{ pretext: '*일정 삭제* | 디자인팀', text: '~11월 12일 (목) 14:00 - 15:00 주간 회의~', color: '4285F4', fallback: 'x' }] };
+
+    shortcut('UB', old);
+    assert.ok(said().includes('관리자만'));
+    shortcut('UA', Object.assign({}, old, { user: 'UX' }));
+    assert.ok(said().includes('Checky Bot이 보낸 메시지만'));
+    assert.strictEqual(env.calls('chat.update').length, 0);
+
+    shortcut('UA', old);
+    const update = env.calls('chat.update').at(-1).params;
+    assert.deepStrictEqual([update.channel, update.ts], ['C1', '5.0'], 'the same message is edited, not reposted');
+    assert.strictEqual(env.posts('C1').length, 0, 'nothing new is posted, so no new notification');
+    assert.strictEqual(flatten({ params: update }), [
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', `종일 | ${title} (1/2)`, '매주 화요일, 13회',
+      '14:00 - 15:00 | A & B 회의',
+      '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건', '일정 없음',
+    ].join('\n'));
+    assert.deepStrictEqual(linksOf(update).map((l) => [l.url, l.text]), [['https://cal/e1', title], ['https://cal/e2', 'A & B 회의']], 'titles become rich_text links (emoji-safe on iOS)');
+    assert.deepStrictEqual(update.attachments.map((a) => a.color), ['#4285F4', '#4285F4', '#E67C73']);
+    assert.strictEqual(update.attachments[0].fallback, `디자인팀 · 종일 ${title}`);
+    assert.ok(said().includes('새 형식으로 고쳤습니다'));
+
+    shortcut('UA', deleted);
+    assert.strictEqual(flatten({ params: env.calls('chat.update').at(-1).params }), '*일정 삭제* | 디자인팀\n~11월 12일 (목) | 14:00 - 15:00 | 주간 회의~');
+
+    // Already in the new format: left alone.
+    shortcut('UA', Object.assign({}, old, { attachments: env.calls('chat.update').at(-1).params.attachments }));
+    assert.ok(said().includes('이미 새 형식'));
+    assert.strictEqual(env.calls('chat.update').length, 2);
+  },
+
   'event titles link to the event, using the occurrence id for recurring events': () => {
     const events = [
       ev('abc123@google.com', '단건 <회의>', '2026-11-09T14:00', '2026-11-09T15:00'),
