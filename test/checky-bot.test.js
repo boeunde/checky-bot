@@ -779,6 +779,22 @@ const tests = {
     assert.ok(said().includes('새 형식으로 고쳤습니다'));
     shortcut('UA', Object.assign({}, v110, { text: '', blocks: undefined, attachments: moved.attachments }));
     assert.ok(said().includes('이미 새 형식'), 'running it again changes nothing');
+
+    // Reminders sent before v1.1.3 end the header with "총 n건"; it becomes the time left, worked out from when it was sent.
+    const reminderAt = (ts, line, header = '*일정 알림* | 디자인팀 | 총 1건') => ({ user: 'UBOT', ts: String(ts / 1000), text: '', attachments: [{ color: '4285F4', fallback: 'x', blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: header } },
+      { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: line }, { type: 'link', url: 'https://cal/e5', text: '회의' }] }] },
+    ] }] });
+    const headerAfter = (msg) => {
+      shortcut('UA', msg);
+      return env.calls('chat.update').at(-1).params.attachments[0].blocks[0].text.text;
+    };
+    assert.strictEqual(headerAfter(reminderAt(kst('2026-11-09T10:15') + 20000, '10:30 - 11:00 | ')), '*일정 알림* | 디자인팀 | 15분 후', 'sent 20s late still reads 15분 후');
+    assert.strictEqual(headerAfter(reminderAt(kst('2026-11-09T09:00'), '종일 | ')), '*일정 알림* | 디자인팀 | 오늘');
+    assert.strictEqual(headerAfter(reminderAt(kst('2026-11-08T23:30'), '00:30 - 01:00 | ', '*일정 알림* | 디자인팀 | 총 2건')), '*일정 알림* | 디자인팀 | 1시간 후', 'across midnight');
+    const daily = reminderAt(kst('2026-11-09T09:00'), '10:30 - 11:00 | ', '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건');
+    shortcut('UA', daily);
+    assert.ok(said().includes('이미 새 형식'), 'daily summaries keep 총 n건');
   },
 
   'event titles link to the event, using the occurrence id for recurring events': () => {

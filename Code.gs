@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.1.3
+ * checky-bot v1.1.4
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -1319,6 +1319,15 @@ function handleRefreshMessage_(payload, userId) {
     fixed[0].blocks = topHeaders.map(section_).concat(fixed[0].blocks);
     if (message.text) fixed[0].fallback = message.text;
   }
+  // v1.1.3 전 일정 알림 머리글의 "총 n건"은 일정까지 남은 시간("15분 후")으로 바꿉니다.
+  const lead = sentReminderLead_(fixed, message.ts);
+  if (lead) {
+    fixed.forEach((a) => {
+      a.blocks = a.blocks.map((b) => (b.type === 'section' && b.text && REMINDER_COUNT_HEADER.test(b.text.text)
+        ? section_(b.text.text.replace(REMINDER_COUNT_HEADER, `$1 | ${lead}`))
+        : b));
+    });
+  }
   const unchanged = !topHeaders.length && attachments.every((a, i) => a.blocks && JSON.stringify(a.blocks) === JSON.stringify(fixed[i].blocks));
   if (unchanged) {
     respond('이미 새 형식이거나, 고칠 일정 메시지가 아닙니다.');
@@ -1400,6 +1409,29 @@ function legacyLine_(text) {
   const head = whenHead_(m[1], m[2]);
   if (linked) return { pieces: [{ text: head }, { text: unescape(m[4]), url: m[3] }, { text: unescape(m[5]) }], strike };
   return { pieces: [{ text: head }, { text: unescape(m[3]) }], strike };
+}
+
+const REMINDER_COUNT_HEADER = /^(\*일정 알림\* \| .+) \| 총 \d+건$/;
+
+/**
+ * 이미 보낸 일정 알림의 남은 시간: 메시지를 보낸 시각(ts)과 첫 일정 줄의 시작 시각을 비교해
+ * 알림 시점 선택지(지금·5분·15분·30분·1시간) 중 가장 가까운 것으로 정합니다. 종일 일정이면 "오늘".
+ * 일정 알림 머리글("총 n건")이 아니면 null입니다.
+ */
+function sentReminderLead_(attachments, ts) {
+  const blocks = attachments.flatMap((a) => a.blocks || []);
+  if (!blocks.some((b) => b.type === 'section' && b.text && REMINDER_COUNT_HEADER.test(b.text.text))) return null;
+  const line = blocks.find((b) => b.type === 'rich_text');
+  const first = line && line.elements[0] && (line.elements[0].elements || [])[0];
+  const text = (first && first.text) || '';
+  if (/^종일/.test(text)) return '오늘';
+  const m = text.match(/^(\d\d):(\d\d) - /);
+  if (!m) return null;
+  const sentAt = Math.round(Number(ts) * 1000);
+  let diff = Number(m[1]) * 60 + Number(m[2]) - kstParts_(sentAt).minutes;
+  if (diff < -12 * 60) diff += 24 * 60; // 자정을 넘긴 경우(23:30에 보낸 00:30 일정)
+  const offset = REMINDER_OFFSETS.reduce((best, o) => (Math.abs(o - diff) < Math.abs(best - diff) ? o : best));
+  return reminderLeadLabel_(offset);
 }
 
 // 예전 일정 줄의 앞부분: "(날짜 )시간 ". 날짜는 변경 알림에만, 여러 날 일정이면 "11월 10일 (화) - 11월 12일 (목)".
