@@ -183,7 +183,7 @@ function createEnv(nowIso) {
           // Slack rejects an attachment that mixes blocks with legacy fields (invalid_attachments).
           if (a.blocks) assert.ok(!a.pretext && !a.text && !a.footer && !a.mrkdwn_in, `attachments[${i}] mixes blocks with legacy fields`);
           (a.blocks || []).filter((b) => b.type === 'rich_text').forEach((b) => b.elements.forEach((sec) => {
-            assert.ok(sec.elements.length && sec.elements.every((e) => e.text), `attachments[${i}] has an empty rich_text piece`);
+            assert.ok(sec.elements.length && sec.elements.every((e) => e.text || (e.type === 'emoji' && e.name)), `attachments[${i}] has an empty rich_text piece`);
           }));
         });
         const res = slack(url.slice('https://slack.com/api/'.length), params);
@@ -239,7 +239,7 @@ function blocksText(blocks) {
     if (b.type === 'context') return b.elements.map((e) => e.text).join(' ');
     if (b.type === 'rich_text') {
       return b.elements.map((s) => {
-        const line = s.elements.map((e) => e.text).join('');
+        const line = s.elements.map((e) => (e.type === 'emoji' ? `[${e.name}]` : e.text)).join('');
         return s.elements.length && s.elements.every((e) => e.style && e.style.strike) ? `~${line}~` : line;
       }).join('\n');
     }
@@ -699,7 +699,8 @@ const tests = {
     const env = connectedEnv('2026-11-09T10:00');
     const shortcut = (user, message) => env.interact({ type: 'message_action', callback_id: 'refresh_message', user: { id: user }, channel: { id: 'C1' }, message, response_url: 'https://hooks.slack.com/actions/r', api_app_id: 'A1' });
     const said = () => env.state.responses.at(-1).body.text;
-    const title = '박보은🌓반차/오후';
+    // Slack hands message contents back with emoji as :name: codes, not as the emoji itself.
+    const title = '박보은:first_quarter_moon:반차/오후';
     const old = {
       user: 'UBOT', ts: '5.0', text: '',
       attachments: [
@@ -721,11 +722,12 @@ const tests = {
     assert.deepStrictEqual([update.channel, update.ts], ['C1', '5.0'], 'the same message is edited, not reposted');
     assert.strictEqual(env.posts('C1').length, 0, 'nothing new is posted, so no new notification');
     assert.strictEqual(flatten({ params: update }), [
-      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', `종일 | ${title} (1/2)`, '매주 화요일, 13회',
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', '종일 | 박보은[first_quarter_moon]반차/오후 (1/2)', '매주 화요일, 13회',
       '14:00 - 15:00 | A & B 회의',
       '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건', '일정 없음',
     ].join('\n'));
-    assert.deepStrictEqual(linksOf(update).map((l) => [l.url, l.text]), [['https://cal/e1', title], ['https://cal/e2', 'A & B 회의']], 'titles become rich_text links (emoji-safe on iOS)');
+    assert.deepStrictEqual(linksOf(update).map((l) => [l.url, l.text]), [['https://cal/e1', '박보은'], ['https://cal/e1', '반차/오후'], ['https://cal/e2', 'A & B 회의']],
+      'titles become rich_text links, split around the emoji (an emoji element cannot sit inside link text)');
     assert.deepStrictEqual(update.attachments.map((a) => a.color), ['#4285F4', '#4285F4', '#E67C73']);
     assert.strictEqual(update.attachments[0].fallback, `디자인팀 · 종일 ${title}`);
     assert.ok(said().includes('새 형식으로 고쳤습니다'));
@@ -737,6 +739,23 @@ const tests = {
     shortcut('UA', Object.assign({}, old, { attachments: env.calls('chat.update').at(-1).params.attachments }));
     assert.ok(said().includes('이미 새 형식'));
     assert.strictEqual(env.calls('chat.update').length, 2);
+
+    // Converted before emoji codes were handled: ":hourglass:" left as text inside the rich_text is fixed on a second run.
+    const stale = { user: 'UBOT', ts: '7.0', text: '', attachments: [{ color: '4285F4', fallback: 'x', blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: '*일정 알림* | 디자인팀 | 총 1건' } },
+      { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [
+        { type: 'text', text: '10:30 - 11:00 | ' }, { type: 'link', url: 'https://cal/e3', text: '마감:hourglass::skin-tone-3:' },
+      ] }] },
+    ] }] };
+    shortcut('UA', stale);
+    const refixed = env.calls('chat.update').at(-1).params;
+    assert.strictEqual(refixed.ts, '7.0');
+    assert.deepStrictEqual(refixed.attachments[0].blocks[1].elements[0].elements, [
+      { type: 'text', text: '10:30 - 11:00 | ' }, { type: 'link', url: 'https://cal/e3', text: '마감' }, { type: 'emoji', name: 'hourglass', skin_tone: 3 },
+    ], 'times like 10:30 stay text; :name: becomes an emoji element');
+    assert.strictEqual(refixed.attachments[0].color, '#4285F4');
+    shortcut('UA', Object.assign({}, stale, { attachments: refixed.attachments }));
+    assert.ok(said().includes('이미 새 형식'));
   },
 
   'event titles link to the event, using the occurrence id for recurring events': () => {

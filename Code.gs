@@ -1298,12 +1298,17 @@ function handleRefreshMessage_(payload, userId) {
     return;
   }
   const attachments = message.attachments || [];
-  if (!attachments.length || attachments.some((a) => a.blocks)) {
+  // 예전 형식 첨부는 새로 만들고, 이미 새 형식인 첨부는 글자로 남은 ":이모지 이름:"만 이모지로 바꿉니다.
+  const fixed = attachments.map((a) => (a.blocks
+    ? { color: slackColor_(a.color), fallback: a.fallback || '', blocks: a.blocks.map(withEmojiBlock_) }
+    : legacyAttachment_(a)));
+  const unchanged = attachments.every((a, i) => a.blocks && JSON.stringify(a.blocks) === JSON.stringify(fixed[i].blocks));
+  if (!attachments.length || unchanged) {
     respond('이미 새 형식이거나, 고칠 일정 메시지가 아닙니다.');
     return;
   }
   try {
-    slackApi_('chat.update', { channel: chId, ts: message.ts, text: message.text || '', attachments: attachments.map(legacyAttachment_) });
+    slackApi_('chat.update', { channel: chId, ts: message.ts, text: message.text || '', attachments: fixed });
   } catch (err) {
     respond(`메시지를 고치지 못했습니다: ${err.message}`);
     return;
@@ -1314,12 +1319,50 @@ function handleRefreshMessage_(payload, userId) {
 /** 예전 형식 첨부 하나 → 지금 형식(머리글은 막대 안 첫 줄, 일정 줄은 rich_text, 설명은 작은 회색 줄) */
 function legacyAttachment_(a) {
   const { pieces, strike } = legacyLine_(a.text || '');
-  // Slack이 돌려주는 색은 "4285F4"처럼 #이 없습니다.
-  const color = a.color ? `#${String(a.color).replace(/^#/, '')}` : null;
-  const attachment = lineAttachment_(color, pieces, { strike, footer: a.footer || '' });
+  const attachment = lineAttachment_(slackColor_(a.color), pieces, { strike, footer: a.footer || '' });
+  attachment.blocks = attachment.blocks.map(withEmojiBlock_);
   if (a.pretext) attachment.blocks.unshift(section_(a.pretext));
   if (a.fallback) attachment.fallback = a.fallback;
   return attachment;
+}
+
+/** Slack이 돌려주는 색은 "4285F4"처럼 #이 없습니다. */
+function slackColor_(color) {
+  return color ? `#${String(color).replace(/^#/, '')}` : null;
+}
+
+/**
+ * Slack이 돌려주는 메시지 내용에서 이모지는 그림 문자가 아니라 ":hourglass:" 같은 이름입니다.
+ * mrkdwn에서는 그림으로 보이지만 rich_text에서는 글자 그대로 보여서, rich_text 이모지 요소로 바꿉니다.
+ * 링크 글자 안에는 이모지 요소를 넣을 수 없어 링크를 이모지 앞뒤로 나눕니다(같은 주소).
+ * 이름에 영문자가 하나는 있어야 이모지로 봅니다("10:30:00" 같은 시각은 그대로).
+ */
+const EMOJI_NAME = /:([a-z0-9_+'-]*[a-z][a-z0-9_+'-]*):(?::skin-tone-([2-6]):)?/;
+
+function withEmojiBlock_(block) {
+  if (!block || block.type !== 'rich_text') return block;
+  return Object.assign({}, block, {
+    elements: (block.elements || []).map((section) => Object.assign({}, section, {
+      elements: (section.elements || []).flatMap(emojiElements_),
+    })),
+  });
+}
+
+function emojiElements_(el) {
+  if ((el.type !== 'text' && el.type !== 'link') || !el.text || !EMOJI_NAME.test(el.text)) return [el];
+  const re = new RegExp(EMOJI_NAME.source, 'g');
+  const out = [];
+  let last = 0;
+  let m;
+  while ((m = re.exec(el.text))) {
+    if (m.index > last) out.push(Object.assign({}, el, { text: el.text.slice(last, m.index) }));
+    const emoji = { type: 'emoji', name: m[1] };
+    if (m[2]) emoji.skin_tone = Number(m[2]);
+    out.push(emoji);
+    last = re.lastIndex;
+  }
+  if (last < el.text.length) out.push(Object.assign({}, el, { text: el.text.slice(last) }));
+  return out;
 }
 
 /**
