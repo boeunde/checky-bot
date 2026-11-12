@@ -569,7 +569,7 @@ function dayHeader_(conn, day, label) {
 function eventAttachment_(color, info, day) {
   const index = info.allDay ? Math.round((day - info.start) / DAY) : 0;
   return lineAttachment_(color, [
-    { text: `${whenText_(info)} ` },
+    { text: `${whenText_(info)} | ` },
     { text: info.title, url: info.link },
     { text: info.allDay ? partLabel_(info, index) : '' },
   ], { footer: descriptionText_(info) });
@@ -1727,7 +1727,8 @@ function changeAttachment_(color, kind, info) {
   // 삭제된 반복 일정은 저장해 둔 날짜가 첫 회차라 날짜를 빼고 시간만 보여 줍니다.
   if (deleted && info.recurring) date = '';
   return lineAttachment_(color, [
-    { text: `${date ? `${date} ` : ''}${whenText_(info)} ` },
+    // "11월 11일 (수) | 16:10 - 20:10 | 제목": 날짜·시간·제목을 | 로 나눠 읽기 쉽게 합니다.
+    { text: `${date ? `${date} | ` : ''}${whenText_(info)} | ` },
     { text: info.title, url: deleted ? null : info.link }, // 삭제된 일정은 링크가 없습니다.
     // 반복 규칙 문장(작은 회색 줄)을 만들지 못했을 때만 제목 뒤에 "(반복)"을 붙입니다.
     { text: info.recurring && !info.recurrence ? ' (반복)' : '' },

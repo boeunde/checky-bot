@@ -544,7 +544,7 @@ const tests = {
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1);
     const text = env.posts('C1')[0];
-    assert.strictEqual(text, '*일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 디자인 리뷰');
+    assert.strictEqual(text, '*일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 | 디자인 리뷰');
     const [raw] = env.rawPosts('C1');
     assert.ok(!raw.blocks && raw.text === '', 'nothing outside the color bar (the Slack activity tab would show only that)');
     const head = raw.attachments[0];
@@ -640,7 +640,7 @@ const tests = {
     timed.setNow('2026-11-09T09:00');
     timed.run('dispatchDue');
     const summary = timed.posts('C1')[0];
-    assert.strictEqual(summary, '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건\n14:00 - 15:00 주간 회의');
+    assert.strictEqual(summary, '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건\n14:00 - 15:00 | 주간 회의');
     assert.strictEqual(timed.rawPosts('C1')[0].attachments[0].color, '#4285F4');
 
     const skip = connectedEnv('2026-11-10T08:50', [], { daily: { empty: 'skip' } });
@@ -668,8 +668,8 @@ const tests = {
     env.run('dispatchDue');
     // A message holds one header (a message block), so each calendar gets its own message; one attachment per event.
     assert.deepStrictEqual(env.posts('C1'), [
-      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n10:00 - 11:00 A 회의\n15:00 - 16:00 A 리뷰',
-      '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건\n13:00 - 14:00 B 배포',
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n10:00 - 11:00 | A 회의\n15:00 - 16:00 | A 리뷰',
+      '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건\n13:00 - 14:00 | B 배포',
     ]);
     assert.deepStrictEqual(env.rawPosts('C1').map((p) => p.attachments.map((a) => a.color)), [['#4285F4', '#4285F4'], ['#E67C73']]);
     assert.strictEqual(env.rawPosts('C1')[0].attachments[0].fallback, '디자인팀 · 오늘 요약 · 총 2건\n10:00 - 11:00 A 회의\n15:00 - 16:00 A 리뷰');
@@ -805,7 +805,7 @@ const tests = {
     shortcut('UA', { user: 'UX', ts: '2.0' });
     assert.strictEqual(env.calls('views.open').length, 0);
 
-    shortcut('UA', { user: 'UBOT', ts: '3.0', attachments: [{ pretext: '*오늘* | *디자인팀*', text: '14:00 - 15:00 주간 회의' }] });
+    shortcut('UA', { user: 'UBOT', ts: '3.0', attachments: [{ pretext: '*오늘* | *디자인팀*', text: '14:00 - 15:00 | 주간 회의' }] });
     assert.strictEqual(env.calls('chat.delete').length, 0, 'nothing is deleted before confirming');
     const modal = env.calls('views.open')[0].params.view;
     assert.strictEqual(modal.callback_id, 'delete_message');
@@ -815,11 +815,11 @@ const tests = {
       text: '알림용 글자',
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*일정 알림* | 디자인팀' } }],
       attachments: [{ blocks: [
-        { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: '14:00 - 15:00 ' }, { type: 'link', url: 'https://x', text: 'A&B 회의' }] }] },
+        { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: '14:00 - 15:00 | ' }, { type: 'link', url: 'https://x', text: 'A&B 회의' }] }] },
         { type: 'context', elements: [{ type: 'mrkdwn', text: '3층' }] },
       ] }],
     });
-    assert.strictEqual(preview, '*일정 알림* | 디자인팀\n14:00 - 15:00 A&amp;B 회의\n3층');
+    assert.strictEqual(preview, '*일정 알림* | 디자인팀\n14:00 - 15:00 | A&amp;B 회의\n3층');
 
     const confirm = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'VD', callback_id: 'delete_message', private_metadata: modal.private_metadata, state: { values: {} } } });
     confirm('UB');
@@ -841,8 +841,8 @@ const tests = {
     const msgs = env.ephemerals('UA');
     assert.ok(!msgs.some((m) => m.includes('[테스트')), 'no test label');
     assert.ok(msgs[0] === '*디자인팀*, *11월 6일 (금)* 에 등록된 일정입니다.');
-    assert.ok(msgs.includes('*하루 요약* | 11월 6일 금요일 | 디자인팀 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
-    assert.ok(msgs.includes('*일정 알림* | 디자인팀 | 총 1건\n14:00 - 15:00 금요일 회의'), msgs.join('\n---\n'));
+    assert.ok(msgs.includes('*하루 요약* | 11월 6일 금요일 | 디자인팀 | 총 1건\n14:00 - 15:00 | 금요일 회의'), msgs.join('\n---\n'));
+    assert.ok(msgs.includes('*일정 알림* | 디자인팀 | 총 1건\n14:00 - 15:00 | 금요일 회의'), msgs.join('\n---\n'));
     assert.ok(!msgs.join('\n').includes('목요일 회의') && !msgs.join('\n').includes('다음 회의'));
     assert.strictEqual(env.posts('C1').length, 0);
   },
@@ -917,7 +917,7 @@ const tests = {
     dispatchAt('2026-11-09T10:06');
     assert.strictEqual(env.posts('C1').length, 0, 'still waiting after the last edit');
     dispatchAt('2026-11-09T10:07');
-    assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) 14:00 - 15:00 주간 회의 (수정)\n3층']);
+    assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) | 14:00 - 15:00 | 주간 회의 (수정)\n3층']);
     assert.strictEqual(linksOf(env.rawPosts('C1')[0])[0].url, 'https://calendar.example/n1', 'title links to the event');
 
     env.setNow('2026-11-09T10:10');
@@ -929,11 +929,11 @@ const tests = {
 
     env.calendarEdit('cal1', 'old', { start: kst('2026-11-10T11:00'), end: kst('2026-11-10T12:00') });
     dispatchAt('2026-11-09T10:14');
-    assert.strictEqual(env.posts('C1')[1], '*일정 변경* | 디자인팀\n11월 10일 (화) 11:00 - 12:00 기존 회의');
+    assert.strictEqual(env.posts('C1')[1], '*일정 변경* | 디자인팀\n11월 10일 (화) | 11:00 - 12:00 | 기존 회의');
 
     env.calendarEdit('cal1', 'old', { deleted: true });
     dispatchAt('2026-11-09T10:16');
-    assert.strictEqual(env.posts('C1')[2], '*일정 삭제* | 디자인팀\n~11월 10일 (화) 11:00 - 12:00 기존 회의~');
+    assert.strictEqual(env.posts('C1')[2], '*일정 삭제* | 디자인팀\n~11월 10일 (화) | 11:00 - 12:00 | 기존 회의~');
     assert.strictEqual(linksOf(env.rawPosts('C1')[2]).length, 0, 'deleted events have no link');
   },
 
@@ -952,7 +952,7 @@ const tests = {
     configure(env, { changes: { enabled: true, types: ['created'], wait: 0, past: true } });
     env.calendarEdit('cal1', 'p2', { title: '지난 일정 등록', start: kst('2026-11-08T16:00'), end: kst('2026-11-08T17:00') });
     env.run('dispatchDue');
-    assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 8일 (일) 16:00 - 17:00 지난 일정 등록']);
+    assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 8일 (일) | 16:00 - 17:00 | 지난 일정 등록']);
   },
 
   'making an event private counts as deleted; a recurring series change is one alert with its repeat rule': () => {
@@ -968,8 +968,8 @@ const tests = {
     env.calendarEdit('cal1', 'rec', { title: '스탠드업 회의' });
     env.run('dispatchDue');
     const posts = env.posts('C1');
-    assert.ok(posts.includes('*일정 삭제* | 디자인팀\n~11월 11일 (수) 10:00 - 11:00 공개 회의~'), posts.join('\n---\n'));
-    assert.ok(posts.includes('*일정 변경* | 디자인팀\n11월 10일 (화) 10:00 - 10:30 스탠드업 회의\n매주 화요일'), posts.join('\n---\n'));
+    assert.ok(posts.includes('*일정 삭제* | 디자인팀\n~11월 11일 (수) | 10:00 - 11:00 | 공개 회의~'), posts.join('\n---\n'));
+    assert.ok(posts.includes('*일정 변경* | 디자인팀\n11월 10일 (화) | 10:00 - 10:30 | 스탠드업 회의\n매주 화요일'), posts.join('\n---\n'));
   },
 
   'an expired sync token re-reads the calendar and still reports changes since the last check': () => {
@@ -1136,7 +1136,7 @@ const tests = {
     addConnection(env, 'cal2');
     env.clearCalls();
     // One message per calendar.
-    const expected = ['*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n종일 창립기념일\n10:00 - 11:00 주간 회의', '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건\n일정 없음'];
+    const expected = ['*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n종일 | 창립기념일\n10:00 - 11:00 | 주간 회의', '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건\n일정 없음'];
 
     assert.strictEqual(env.command({ user_id: 'UB', channel_id: 'C1', text: 'today' }).content, '');
     assert.deepStrictEqual(env.ephemerals('UB'), expected, 'whole day regardless of daily summary settings; empty calendars say 일정 없음');
@@ -1184,7 +1184,7 @@ const tests = {
     assert.strictEqual(held.posts('C1').length, 0, 'held until 09:00 Monday');
     held.setNow('2026-11-09T09:00');
     held.run('dispatchDue');
-    assert.deepStrictEqual(held.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) 14:00 - 15:00 주말에 등록', '*일정 등록* | 디자인팀\n11월 13일 (금) 14:00 - 15:00 일요일에 등록'], 'one message per event');
+    assert.deepStrictEqual(held.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) | 14:00 - 15:00 | 주말에 등록', '*일정 등록* | 디자인팀\n11월 13일 (금) | 14:00 - 15:00 | 일요일에 등록'], 'one message per event');
 
     held.command({ user_id: 'UA', channel_id: 'C1' });
     assert.ok(JSON.stringify(held.calls('views.open').at(-1).params.view).includes('✏️ 변경 알림 (월-금)  |  등록만  |  즉시 알림  |  과거 일정 변경 알림 X  |  미설정요일 알림 모아보내기 O (오전 9:00)'));
@@ -1233,11 +1233,11 @@ const tests = {
     env.calendarEdit('cal1', 'old', { title: '기존 회의 (변경)' });
     env.calendarEdit('cal1', 'old2', { deleted: true });
     env.run('dispatchDue');
-    assert.deepStrictEqual(env.posts('C1'), ['*일정 변경* | 디자인팀\n11월 16일 (월) 10:00 - 11:00 기존 회의 (변경)'], 'Monday: the update is sent, the delete is not (set 2 is Friday only)');
+    assert.deepStrictEqual(env.posts('C1'), ['*일정 변경* | 디자인팀\n11월 16일 (월) | 10:00 - 11:00 | 기존 회의 (변경)'], 'Monday: the update is sent, the delete is not (set 2 is Friday only)');
     env.setNow('2026-11-13T10:00'); // Friday
     env.calendarEdit('cal1', 'old', { deleted: true });
     env.run('dispatchDue');
-    assert.strictEqual(env.posts('C1').at(-1), '*일정 삭제* | 디자인팀\n~11월 16일 (월) 10:00 - 11:00 기존 회의 (변경)~', 'Friday: deletes follow set 2');
+    assert.strictEqual(env.posts('C1').at(-1), '*일정 삭제* | 디자인팀\n~11월 16일 (월) | 10:00 - 11:00 | 기존 회의 (변경)~', 'Friday: deletes follow set 2');
 
     env.command({ user_id: 'UA', channel_id: 'C1' });
     const view = JSON.stringify(env.calls('views.open').at(-1).params.view);
