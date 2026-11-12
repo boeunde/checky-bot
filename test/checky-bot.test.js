@@ -178,6 +178,14 @@ function createEnv(nowIso) {
         const params = Object.assign({}, opts.payload);
         ['view', 'blocks', 'attachments'].forEach((k) => { if (params[k]) params[k] = JSON.parse(params[k]); });
         if (params.view || params.blocks) checkBlockKit(params.view || params.blocks);
+        (params.attachments || []).forEach((a, i) => {
+          checkBlockKit(a.blocks || [], `attachments[${i}].blocks`);
+          // Slack rejects an attachment that mixes blocks with legacy fields (invalid_attachments).
+          if (a.blocks) assert.ok(!a.pretext && !a.text && !a.footer && !a.mrkdwn_in, `attachments[${i}] mixes blocks with legacy fields`);
+          (a.blocks || []).filter((b) => b.type === 'rich_text').forEach((b) => b.elements.forEach((sec) => {
+            assert.ok(sec.elements.length && sec.elements.every((e) => e.text), `attachments[${i}] has an empty rich_text piece`);
+          }));
+        });
         const res = slack(url.slice('https://slack.com/api/'.length), params);
         return { getContentText: () => JSON.stringify(res), getResponseCode: () => 200 };
       }
@@ -221,15 +229,38 @@ function createEnv(nowIso) {
 }
 
 // A message as one string: its text, then each attachment's pretext and text, with links shown as their label.
+/**
+ * A message as Slack shows it, one string: its blocks (or its text when there are none),
+ * then each attachment. rich_text lines struck through in full read as ~line~; links read as their text.
+ */
+function blocksText(blocks) {
+  return (blocks || []).map((b) => {
+    if (b.type === 'section') return b.text.text;
+    if (b.type === 'context') return b.elements.map((e) => e.text).join(' ');
+    if (b.type === 'rich_text') {
+      return b.elements.map((s) => {
+        const line = s.elements.map((e) => e.text).join('');
+        return s.elements.length && s.elements.every((e) => e.style && e.style.strike) ? `~${line}~` : line;
+      }).join('\n');
+    }
+    return '';
+  });
+}
+
 function flatten(call) {
-  const parts = [call.params.text || ''];
-  (call.params.attachments || []).forEach((a) => {
+  const p = call.params;
+  const parts = p.blocks && p.blocks.length ? blocksText(p.blocks) : [p.text || ''];
+  (p.attachments || []).forEach((a) => {
     if (a.pretext) parts.push(a.pretext);
-    parts.push(a.text);
+    if (a.text) parts.push(a.text);
     if (a.footer) parts.push(a.footer);
+    parts.push(...blocksText(a.blocks));
   });
   return parts.join('\n').replace(/<https?:[^|>]+\|([^>]+)>/g, '$1').trim();
 }
+
+/** The links in a message's attachments (rich_text link elements). */
+const linksOf = (params) => (params.attachments || []).flatMap((a) => (a.blocks || []).flatMap((b) => (b.type === 'rich_text' ? b.elements.flatMap((s) => s.elements.filter((e) => e.type === 'link')) : [])));
 
 const eidOf = (link) => Buffer.from(new URL(link).searchParams.get('eid').replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 
@@ -514,8 +545,10 @@ const tests = {
     assert.strictEqual(env.posts('C1').length, 1);
     const text = env.posts('C1')[0];
     assert.strictEqual(text, '*일정 알림* | 디자인팀 | 총 1건\n10:30 - 11:00 디자인 리뷰');
-    const [attachment] = env.rawPosts('C1')[0].attachments;
-    assert.ok(attachment.pretext.startsWith('*일정 알림*') && !attachment.text.includes('디자인팀'), 'calendar line sits outside the color bar');
+    const [raw] = env.rawPosts('C1');
+    assert.strictEqual(raw.blocks[0].text.text, '*일정 알림* | 디자인팀 | 총 1건', 'the header is a message block, outside the color bar');
+    assert.ok(!blocksText(raw.attachments[0].blocks).join('').includes('디자인팀'));
+    assert.strictEqual(raw.text, '디자인팀 · 10:30 - 11:00 디자인 리뷰', 'notifications read the text');
 
     event.start = kst('2026-11-09T10:40');
     event.end = kst('2026-11-09T11:10');
@@ -539,9 +572,9 @@ const tests = {
     env.run('dispatchDue');
     const posts = env.rawPosts('C1');
     assert.strictEqual(posts.length, 2, 'one message per calendar');
-    const design = posts.find((p) => p.attachments[0].pretext.includes('디자인팀'));
+    const design = posts.find((p) => p.blocks[0].text.text.includes('디자인팀'));
     assert.strictEqual(design.attachments.length, 2);
-    assert.ok(design.attachments[0].pretext.endsWith('| 총 2건') && !design.attachments[1].pretext, 'header once, with count');
+    assert.ok(design.blocks.length === 1 && design.blocks[0].text.text.endsWith('| 총 2건'), 'header once, with count');
 
     events.push(ev('n', '새 일정', '2026-11-09T10:30', '2026-11-09T11:00'));
     env.run('onCalendarChanged');
@@ -550,7 +583,7 @@ const tests = {
     const latest = env.rawPosts('C1');
     assert.strictEqual(latest.length, 3);
     assert.strictEqual(latest[2].attachments.length, 1);
-    assert.ok(latest[2].attachments[0].text.includes('새 일정'));
+    assert.ok(blocksText(latest[2].attachments[0].blocks)[0].includes('새 일정'));
   },
 
   'weekday filter uses the event day, not the send day': () => {
@@ -593,11 +626,10 @@ const tests = {
     const [post] = env.rawPosts('C1');
     assert.strictEqual(env.rawPosts('C1').length, 1);
     assert.strictEqual(post.attachments.length, 2);
-    const byTitle = (t) => post.attachments.find((a) => a.text.includes(t));
+    const byTitle = (t) => blocksText(post.attachments.find((a) => blocksText(a.blocks)[0].includes(t)).blocks);
     const meeting = byTitle('공개 회의');
-    assert.strictEqual(meeting.footer, '회의실 &amp; 링크', 'description goes to the small gray footer, not a quote');
-    assert.ok(!meeting.text.includes('>') || meeting.text.includes('<https'), meeting.text);
-    assert.strictEqual(byTitle('긴 설명').footer, `${'a'.repeat(299)}…`, 'footer is capped at 300 characters');
+    assert.strictEqual(meeting[1], '회의실 &amp; 링크', 'description goes to the small gray line, not a quote');
+    assert.strictEqual(byTitle('긴 설명')[1], `${'a'.repeat(299)}…`, 'the gray line is capped at 300 characters');
   },
 
   'daily summary respects scope and the empty-day option': () => {
@@ -620,7 +652,7 @@ const tests = {
     assert.strictEqual(send.posts('C1')[0], '*오늘 요약* | 11월 10일 화요일 | 디자인팀 | 총 0건\n일정 없음');
   },
 
-  'daily summaries for the same channel and time are grouped by calendar in one message': () => {
+  'daily summaries at the same time go out as one message per calendar': () => {
     const env = connectedEnv('2026-11-09T08:40', [ev('a1', 'A 회의', '2026-11-09T10:00', '2026-11-09T11:00'), ev('a2', 'A 리뷰', '2026-11-09T15:00', '2026-11-09T16:00')]);
     env.addCalendar('cal2', '개발팀', [ev('b1', 'B 배포', '2026-11-09T13:00', '2026-11-09T14:00')]);
     env.state.calendars.cal2.color = '#E67C73';
@@ -632,23 +664,33 @@ const tests = {
     configure(env, { daily: { time: 600 } }, 'UA', 2); // 10:00, a separate message
     env.setNow('2026-11-09T09:00');
     env.run('dispatchDue');
-    const nine = env.posts('C1');
-    assert.strictEqual(nine.length, 1);
-    // One attachment per event; the calendar header rides only on each calendar's first event, outside the bar.
-    const attachments = env.rawPosts('C1')[0].attachments;
-    assert.deepStrictEqual(attachments.map((a) => a.pretext || null), [
-      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', null, '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건',
+    // A message holds one header (a message block), so each calendar gets its own message; one attachment per event.
+    assert.deepStrictEqual(env.posts('C1'), [
+      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n10:00 - 11:00 A 회의\n15:00 - 16:00 A 리뷰',
+      '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건\n13:00 - 14:00 B 배포',
     ]);
-    assert.deepStrictEqual(attachments.map((a) => a.color), ['#4285F4', '#4285F4', '#E67C73']);
-    assert.strictEqual(nine[0], [
-      '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건', '10:00 - 11:00 A 회의', '15:00 - 16:00 A 리뷰',
-      '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 1건', '13:00 - 14:00 B 배포',
-    ].join('\n'));
+    assert.deepStrictEqual(env.rawPosts('C1').map((p) => p.attachments.map((a) => a.color)), [['#4285F4', '#4285F4'], ['#E67C73']]);
+    assert.strictEqual(env.rawPosts('C1')[0].text, '디자인팀 · 오늘 요약 · 총 2건\n10:00 - 11:00 A 회의\n15:00 - 16:00 A 리뷰');
+    env.setNow('2026-11-09T09:05');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 2, 'each calendar is sent once');
     env.setNow('2026-11-09T10:00');
     env.run('rebuildSchedule');
     env.run('dispatchDue');
-    assert.strictEqual(env.posts('C1').length, 2);
-    assert.ok(env.posts('C1')[1].startsWith('*오늘 요약* | 11월 9일 월요일 | 전사'));
+    assert.strictEqual(env.posts('C1').length, 3);
+    assert.ok(env.posts('C1')[2].startsWith('*오늘 요약* | 11월 9일 월요일 | 전사'));
+  },
+
+  'titles with emoji stay whole inside a rich_text link (iOS drops text before an emoji in mrkdwn links)': () => {
+    const title = '박보은🌓반차/오후';
+    const env = connectedEnv('2026-11-09T08:50', [allDay('h', title, '2026-11-09', '2026-11-10')]);
+    env.setNow('2026-11-09T09:00');
+    env.run('dispatchDue');
+    const [raw] = env.rawPosts('C1');
+    const [link] = linksOf(raw);
+    assert.strictEqual(link.text, title);
+    assert.ok(!JSON.stringify(raw.attachments).includes('|'), 'no mrkdwn <url|title> links in the event lines');
+    assert.ok(raw.text.includes(title), 'the notification text keeps the title too');
   },
 
   'event titles link to the event, using the occurrence id for recurring events': () => {
@@ -660,13 +702,10 @@ const tests = {
     const env = connectedEnv('2026-11-09T08:50', events);
     env.setNow('2026-11-09T09:00');
     env.run('dispatchDue');
-    const texts = env.rawPosts('C1')[0].attachments.map((a) => a.text);
-    const link = (text) => text.match(/<(https:[^|]+)\|([^>]+)>/);
-    const [, holLink, holTitle] = link(texts[0]);
-    const [, oneLink, oneTitle] = link(texts[1]);
-    const [, weeklyLink] = link(texts[2]);
+    const [hol, one, weekly] = linksOf(env.rawPosts('C1')[0]);
+    const [holLink, holTitle, oneLink, oneTitle, weeklyLink] = [hol.url, hol.text, one.url, one.text, weekly.url];
     assert.strictEqual(holTitle, '휴일');
-    assert.strictEqual(oneTitle, '단건 &lt;회의&gt;');
+    assert.strictEqual(oneTitle, '단건 <회의>', 'rich_text links take the title as is (no escaping, emoji-safe on iOS)');
     assert.ok(oneLink.startsWith('https://www.google.com/calendar/event?eid='));
     assert.strictEqual(eidOf(oneLink), 'abc123 cal1');
     assert.strictEqual(eidOf(weeklyLink), 'weekly9_20261109T070000Z cal1');
@@ -769,6 +808,16 @@ const tests = {
     const modal = env.calls('views.open')[0].params.view;
     assert.strictEqual(modal.callback_id, 'delete_message');
     assert.ok(JSON.stringify(modal.blocks).includes('주간 회의'));
+    // Current messages: header block + rich_text attachments; the notification text is not shown.
+    const preview = env.sandbox.messagePreview_({
+      text: '알림용 글자',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*일정 알림* | 디자인팀' } }],
+      attachments: [{ blocks: [
+        { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: '14:00 - 15:00 ' }, { type: 'link', url: 'https://x', text: 'A&B 회의' }] }] },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: '3층' }] },
+      ] }],
+    });
+    assert.strictEqual(preview, '*일정 알림* | 디자인팀\n14:00 - 15:00 A&amp;B 회의\n3층');
 
     const confirm = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'VD', callback_id: 'delete_message', private_metadata: modal.private_metadata, state: { values: {} } } });
     confirm('UB');
@@ -867,7 +916,7 @@ const tests = {
     assert.strictEqual(env.posts('C1').length, 0, 'still waiting after the last edit');
     dispatchAt('2026-11-09T10:07');
     assert.deepStrictEqual(env.posts('C1'), ['*일정 등록* | 디자인팀\n11월 12일 (목) 14:00 - 15:00 주간 회의 (수정)\n3층']);
-    assert.ok(env.rawPosts('C1')[0].attachments[0].text.includes('<https://calendar.example/n1|'), 'title links to the event');
+    assert.strictEqual(linksOf(env.rawPosts('C1')[0])[0].url, 'https://calendar.example/n1', 'title links to the event');
 
     env.setNow('2026-11-09T10:10');
     env.calendarEdit('cal1', 'n2', { title: '오타', start: kst('2026-11-12T16:00'), end: kst('2026-11-12T17:00') });
@@ -883,7 +932,7 @@ const tests = {
     env.calendarEdit('cal1', 'old', { deleted: true });
     dispatchAt('2026-11-09T10:16');
     assert.strictEqual(env.posts('C1')[2], '*일정 삭제* | 디자인팀\n~11월 10일 (화) 11:00 - 12:00 기존 회의~');
-    assert.ok(!env.rawPosts('C1')[2].attachments[0].text.includes('<https'), 'deleted events have no link');
+    assert.strictEqual(linksOf(env.rawPosts('C1')[2]).length, 0, 'deleted events have no link');
   },
 
   'change alert types and the past-event option filter what is sent': () => {
@@ -1084,10 +1133,11 @@ const tests = {
     env.addCalendar('cal2', '개발팀', []);
     addConnection(env, 'cal2');
     env.clearCalls();
-    const expected = '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n종일 창립기념일\n10:00 - 11:00 주간 회의\n*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건\n일정 없음';
+    // One message per calendar.
+    const expected = ['*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건\n종일 창립기념일\n10:00 - 11:00 주간 회의', '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건\n일정 없음'];
 
     assert.strictEqual(env.command({ user_id: 'UB', channel_id: 'C1', text: 'today' }).content, '');
-    assert.deepStrictEqual(env.ephemerals('UB'), [expected], 'whole day regardless of daily summary settings; empty calendars say 일정 없음');
+    assert.deepStrictEqual(env.ephemerals('UB'), expected, 'whole day regardless of daily summary settings; empty calendars say 일정 없음');
     assert.strictEqual(env.posts('C1').length, 0);
 
     assert.ok(response(env.command({ user_id: 'UB', channel_id: 'C1', text: 'today-all' })).text.includes('관리자만'));
@@ -1099,7 +1149,7 @@ const tests = {
     const submit = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'V6', callback_id: 'today_all', private_metadata: confirm.private_metadata, state: { values: {} } } });
     assert.strictEqual(response(submit('UB')).response_action, 'update', 'non-admins cannot confirm');
     assert.strictEqual(submit('UA').content, '');
-    assert.deepStrictEqual(env.posts('C1'), [expected]);
+    assert.deepStrictEqual(env.posts('C1'), expected);
     assert.strictEqual(env.channel('C1').log[0].text, '오늘 일정 채널에 발송');
 
     assert.ok(response(env.command({ user_id: 'UA', channel_id: 'C9', text: 'today' })).text.includes('연결된 캘린더가 없습니다'));
@@ -1214,7 +1264,8 @@ const tests = {
     daily.setNow('2026-11-10T09:00');
     daily.run('dispatchDue');
     const [att] = daily.rawPosts('C1')[0].attachments;
-    assert.strictEqual(att.footer, '매주 화요일, 13회\n3층', 'repeat rule first, then the description');
+    assert.strictEqual(att.blocks[1].type, 'context', 'small gray line inside the color bar');
+    assert.strictEqual(blocksText(att.blocks)[1], '매주 화요일, 13회\n3층', 'repeat rule first, then the description');
     const reads = () => daily.state.apiCalls.filter((c) => c.get).length;
     const before = reads();
     daily.run('rebuildSchedule');
