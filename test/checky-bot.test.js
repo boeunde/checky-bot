@@ -694,6 +694,65 @@ const tests = {
     assert.ok(env.posts('C1')[2].startsWith('*오늘 요약* | 11월 9일 월요일 | 전사'));
   },
 
+  'the "일정 새로고침" shortcut re-reads a daily summary into the same message (admins only)': () => {
+    const env = connectedEnv('2026-11-09T08:50', [], { daily: { empty: 'send', scope: 'timed' } });
+    env.setNow('2026-11-09T09:00');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1')[0], '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 0건\n일정 없음');
+    const sent = Object.assign({ user: 'UBOT', ts: String(kst('2026-11-09T09:00') / 1000) }, env.rawPosts('C1')[0]);
+    const shortcut = (user, message) => env.interact({ type: 'message_action', callback_id: 'refresh_events', user: { id: user }, channel: { id: 'C1' }, message, response_url: 'https://hooks.slack.com/actions/r', api_app_id: 'A1' });
+    const said = () => env.state.responses.at(-1).body.text;
+
+    // Events added after the summary went out; the all-day one is outside the "시간 일정만" scope.
+    env.state.calendars.cal1.events.push(ev('n1', '긴급 회의', '2026-11-09T14:00', '2026-11-09T15:00'), allDay('n2', '창립기념일', '2026-11-09', '2026-11-10'));
+    env.setNow('2026-11-09T11:20');
+
+    shortcut('UB', sent);
+    assert.ok(said().includes('관리자만'));
+    shortcut('UA', Object.assign({}, sent, { user: 'UX' }));
+    assert.ok(said().includes('Checky Bot이 보낸'));
+    assert.strictEqual(env.calls('chat.update').length, 0);
+
+    shortcut('UA', sent);
+    const update = env.calls('chat.update').at(-1).params;
+    assert.deepStrictEqual([update.channel, update.ts], ['C1', sent.ts], 'the same message is edited');
+    assert.strictEqual(env.posts('C1').length, 1, 'nothing new is posted, so no new notification');
+    assert.strictEqual(flatten({ params: update }), '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건\n14:00 - 15:00 | 긴급 회의\n11:20 새로고침');
+    assert.ok(update.attachments[0].fallback.includes('긴급 회의'));
+    assert.ok(said().includes('다시 불러왔습니다 (총 1건)'));
+
+    // Refreshing again rebuilds from scratch: one "새로고침" line, with the new time.
+    env.setNow('2026-11-09T12:05');
+    shortcut('UA', Object.assign({}, sent, { attachments: update.attachments }));
+    assert.strictEqual(flatten(env.calls('chat.update').at(-1)), '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 1건\n14:00 - 15:00 | 긴급 회의\n12:05 새로고침');
+
+    // Not a daily summary, a summary of a calendar no longer here, or an old summary of several calendars: refused.
+    const reminder = { user: 'UBOT', ts: '9.0', attachments: [{ color: '4285F4', fallback: 'x', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*일정 알림* | 디자인팀 | 15분 후' } }] }] };
+    shortcut('UA', reminder);
+    assert.ok(said().includes('하루 요약 메시지만'));
+    shortcut('UA', Object.assign({}, sent, { attachments: [{ pretext: '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건', text: '일정 없음' }] }));
+    assert.ok(said().includes('"개발팀"이 없습니다'));
+    shortcut('UA', Object.assign({}, sent, { attachments: [
+      { pretext: '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 0건', text: '일정 없음' },
+      { pretext: '*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건', text: '일정 없음' },
+    ] }));
+    assert.ok(said().includes('today-all'));
+    assert.strictEqual(env.calls('chat.update').length, 2);
+
+    // A pre-v1.1.0 single-calendar summary (pretext header) is rebuilt in the current format.
+    shortcut('UA', Object.assign({}, sent, { attachments: [{ pretext: '*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 0건', text: '일정 없음', color: '4285F4' }] }));
+    assert.ok(!env.calls('chat.update').at(-1).params.attachments[0].pretext);
+    assert.ok(flatten(env.calls('chat.update').at(-1)).includes('긴급 회의'));
+  },
+
+  'the summary date gets its year from when the message was sent': () => {
+    const env = createEnv('2026-11-09T09:00');
+    const day = (m, d, sentIso) => env.sandbox.dayKey_(env.sandbox.summaryDay_(m, d, kst(sentIso)));
+    assert.strictEqual(day(11, 9, '2026-11-09T09:00'), '2026-11-09');
+    assert.strictEqual(day(1, 1, '2026-12-31T18:00'), '2027-01-01', 'a "내일 요약" sent on New Year\'s Eve');
+    assert.strictEqual(day(12, 31, '2027-01-01T10:00'), '2026-12-31');
+  },
+
   'titles with emoji stay whole inside a rich_text link (iOS drops text before an emoji in mrkdwn links)': () => {
     const title = '박보은🌓반차/오후';
     const env = connectedEnv('2026-11-09T08:50', [allDay('h', title, '2026-11-09', '2026-11-10')]);

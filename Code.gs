@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.1.5
+ * checky-bot v1.2.0
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -51,6 +51,7 @@ const HELP_TEXT = [
   '• `/checky today`: 이 채널 캘린더의 오늘 일정을 나에게만 보여 줍니다.',
   '• `/checky today-all`: 오늘 일정을 채널에 보냅니다 (채널 관리자만).',
   '• 봇 메시지 지우기: 메시지의 ⋯ 메뉴 > Checky Bot 메시지 삭제 (채널 관리자만)',
+  '• 하루 요약 다시 불러오기: 요약 메시지의 ⋯ 메뉴 > Checky Bot 일정 새로고침 (채널 관리자만)',
 ].join('\n');
 
 // ─── 설치와 자동 실행 ─────────────────────────────────────
@@ -904,6 +905,9 @@ function handleInteraction_(payload) {
   if (payload.type === 'message_action' && payload.callback_id === 'refresh_message') {
     handleRefreshMessage_(payload, userId);
   }
+  if (payload.type === 'message_action' && payload.callback_id === 'refresh_events') {
+    handleRefreshEvents_(payload, userId);
+  }
   return null;
 }
 
@@ -1343,6 +1347,95 @@ function handleRefreshMessage_(payload, userId) {
     return;
   }
   respond('메시지를 새 형식으로 고쳤습니다.');
+}
+
+/**
+ * 메시지 ⋯ > "Checky Bot 일정 새로고침"(callback ID: refresh_events). 그 채널 관리자만 쓸 수 있습니다.
+ * 하루 요약 메시지의 머리글(날짜·캘린더)로 그날 일정을 다시 읽어 같은 메시지를 고칩니다.
+ * 요약을 보낸 뒤 추가·변경된 일정을 반영할 때 씁니다. 새로 보내지 않으므로 알림은 다시 가지 않고,
+ * 맨 아래에 "14:30 새로고침"을 작은 회색 글씨로 붙입니다.
+ * 범위(모든 일정/종일만/시간만)는 지금 하루 요약 설정을 따릅니다.
+ * 캘린더 여러 개가 한 메시지에 묶인 v1.1.0 전 요약은 고칠 수 없습니다.
+ */
+function handleRefreshEvents_(payload, userId) {
+  const chId = payload.channel.id;
+  const message = payload.message || {};
+  const respond = (text) => respondEphemeral_(payload.response_url, text);
+  const ch = loadChannel_(chId);
+  if (!isAdmin_(ch, userId)) {
+    respond('이 채널의 관리자만 일정을 새로고침할 수 있습니다.');
+    return;
+  }
+  if (!isOwnMessage_(payload)) {
+    respond('Checky Bot이 보낸 하루 요약 메시지만 새로고침할 수 있습니다.');
+    return;
+  }
+  const headers = messageHeaders_(message).map((h) => h.match(DAILY_HEADER)).filter(Boolean);
+  if (!headers.length) {
+    respond('하루 요약 메시지만 새로고침할 수 있습니다.');
+    return;
+  }
+  if (headers.length > 1) {
+    respond('캘린더 여러 개가 한 메시지에 묶인 예전 요약은 새로고침할 수 없습니다. `/checky today-all`로 새로 보내세요.');
+    return;
+  }
+  const [, month, date, name] = headers[0];
+  const sentAt = Math.round(Number(message.ts) * 1000);
+  const day = summaryDay_(Number(month), Number(date), sentAt);
+  const conn = ch.connections.find((c) => escapeSlack_(c.calendarName) === name || c.calendarName === name);
+  if (!conn) {
+    respond(`이 채널에 연결된 캘린더 중 "${name}"이 없습니다.`);
+    return;
+  }
+  const calendar = openCalendar_(conn.calendarId);
+  if (!calendar) {
+    respond('캘린더를 읽지 못했습니다. 공용 구글 계정에 캘린더가 공유돼 있는지 확인하세요.');
+    return;
+  }
+  // 이미 보낸 요약이므로 일정이 없어도 "일정 없음"으로 고칩니다. "오늘"/"내일"은 처음 보낸 시각 기준 그대로입니다.
+  const entry = {
+    conn: Object.assign({}, conn, { daily: Object.assign({}, conn.daily, { empty: 'send' }) }),
+    infos: readEvents_(calendar, day, day + DAY),
+    color: calendarColor_(calendar),
+  };
+  const [rebuilt] = dailyMessages_(day, [entry], sentAt);
+  const last = rebuilt.attachments[rebuilt.attachments.length - 1];
+  last.blocks = last.blocks.concat(context_(`${formatClock_(Date.now())} 새로고침`));
+  const params = { channel: chId, ts: message.ts, text: '', attachments: rebuilt.attachments };
+  if (message.blocks && message.blocks.length) params.blocks = []; // 빈 배열을 보내야 본문 블록이 지워집니다.
+  try {
+    slackApi_('chat.update', params);
+  } catch (err) {
+    respond(`메시지를 고치지 못했습니다: ${err.message}`);
+    return;
+  }
+  const count = rebuilt.attachments[0].blocks[0].text.text.match(/총 (\d+)건$/);
+  respond(`일정을 다시 불러왔습니다${count ? ` (총 ${count[1]}건)` : ''}.`);
+}
+
+// 하루 요약 머리글: "*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건" → [월, 일, 캘린더 이름]
+const DAILY_HEADER = /^\*(?:오늘|내일|하루) 요약\* \| (\d{1,2})월 (\d{1,2})일 [일월화수목금토]요일 \| (.+) \| 총 \d+건$/;
+
+/** 메시지의 머리글 후보: 본문 블록(v1.1.0), 첨부의 pretext(v1.1.0 전), 첨부 안 section 블록(지금) */
+function messageHeaders_(message) {
+  const texts = [];
+  const fromBlocks = (blocks) => (blocks || []).forEach((b) => {
+    if (b.type === 'section' && b.text) texts.push(b.text.text);
+  });
+  fromBlocks(message.blocks);
+  (message.attachments || []).forEach((a) => {
+    if (a.pretext) texts.push(a.pretext);
+    fromBlocks(a.blocks);
+  });
+  return texts;
+}
+
+/** 머리글에는 연도가 없어, 메시지를 보낸 시각에 가장 가까운 그 월·일을 고릅니다(12월 31일에 보낸 1월 1일 요약 등). */
+function summaryDay_(month, date, sentAt) {
+  const year = kstParts_(sentAt).y;
+  return [year - 1, year, year + 1]
+    .map((y) => Date.UTC(y, month - 1, date) - KST_OFFSET)
+    .reduce((best, d) => (Math.abs(d - sentAt) < Math.abs(best - sentAt) ? d : best));
 }
 
 /** 예전 형식 첨부 하나 → 지금 형식(머리글은 막대 안 첫 줄, 일정 줄은 rich_text, 설명은 작은 회색 줄) */
