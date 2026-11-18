@@ -745,6 +745,41 @@ const tests = {
     assert.ok(flatten(env.calls('chat.update').at(-1)).includes('긴급 회의'));
   },
 
+  'the "일정 새로고침" shortcut finds calendars whose names have emoji (Slack hands them back as :name: codes)': () => {
+    const env = connectedEnv('2026-11-09T10:00', [ev('n1', '긴급 회의', '2026-11-09T14:00', '2026-11-09T15:00')]);
+    const rename = (name) => {
+      const ch = env.channel('C1');
+      ch.connections[0].calendarName = name;
+      env.state.props.CH_C1 = JSON.stringify(ch);
+    };
+    const shortcut = (header) => env.interact({ type: 'message_action', callback_id: 'refresh_events', user: { id: 'UA' }, channel: { id: 'C1' },
+      message: { user: 'UBOT', ts: String(kst('2026-11-09T09:00') / 1000), attachments: [{ color: '4285F4', fallback: 'x', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: header } }] }] },
+      response_url: 'https://hooks.slack.com/actions/r', api_app_id: 'A1' });
+    const said = () => env.state.responses.at(-1).body.text;
+
+    // Known emoji, a trailing space in the calendar name, and & as Slack escapes it.
+    rename('🌓 A&B 디자인팀 ');
+    shortcut('*오늘 요약* | 11월 9일 월요일 | :first_quarter_moon: A&amp;B 디자인팀  | 총 0건');
+    assert.ok(said().includes('다시 불러왔습니다 (총 1건)'), said());
+    assert.ok(flatten(env.calls('chat.update').at(-1)).startsWith('*오늘 요약* | 11월 9일 월요일 | 🌓 A&amp;B 디자인팀  | 총 1건'));
+
+    // An emoji the name table doesn't know (or the table could not be fetched): matched with emoji left out.
+    rename('🧡 HSES (GG+키친) ');
+    shortcut('*오늘 요약* | 11월 9일 월요일 | :orange_heart: HSES (GG+키친)  | 총 0건');
+    assert.ok(said().includes('다시 불러왔습니다'), said());
+
+    shortcut('*오늘 요약* | 11월 9일 월요일 | 개발팀 | 총 0건');
+    assert.ok(said().includes('"개발팀"이 없습니다'));
+  },
+
+  'app home shows the code version, the same as the file header': () => {
+    const env = connectedEnv('2026-11-09T10:00');
+    env.event({ type: 'app_home_opened', user: 'UA', tab: 'home' });
+    const blocks = env.calls('views.publish').at(-1).params.view.blocks;
+    const header = CODE.match(/\* checky-bot v(\d+\.\d+\.\d+)/)[1];
+    assert.strictEqual(blocksText(blocks).at(-1), `Checky Bot v${header}`);
+  },
+
   'the summary date gets its year from when the message was sent': () => {
     const env = createEnv('2026-11-09T09:00');
     const day = (m, d, sentIso) => env.sandbox.dayKey_(env.sandbox.summaryDay_(m, d, kst(sentIso)));

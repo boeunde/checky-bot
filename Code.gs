@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.2.0
+ * checky-bot v1.2.1
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -35,6 +35,8 @@ const NOTIFY_COOLDOWN = 6 * 60 * MINUTE;
 const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 수 있습니다.
 
 const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
+// 앱 홈 맨 아래에 보여 주는 코드 버전. 맨 위 주석의 버전과 함께 올립니다.
+const VERSION = '1.2.1';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -1382,9 +1384,9 @@ function handleRefreshEvents_(payload, userId) {
   const [, month, date, name] = headers[0];
   const sentAt = Math.round(Number(message.ts) * 1000);
   const day = summaryDay_(Number(month), Number(date), sentAt);
-  const conn = ch.connections.find((c) => escapeSlack_(c.calendarName) === name || c.calendarName === name);
+  const conn = findConnectionByName_(ch.connections, name);
   if (!conn) {
-    respond(`이 채널에 연결된 캘린더 중 "${name}"이 없습니다.`);
+    respond(`이 채널에 연결된 캘린더 중 "${emojiText_(name).trim()}"이 없습니다.`);
     return;
   }
   const calendar = openCalendar_(conn.calendarId);
@@ -1416,7 +1418,27 @@ function handleRefreshEvents_(payload, userId) {
 // 하루 요약 머리글: "*오늘 요약* | 11월 9일 월요일 | 디자인팀 | 총 2건" → [월, 일, 캘린더 이름]
 const DAILY_HEADER = /^\*(?:오늘|내일|하루) 요약\* \| (\d{1,2})월 (\d{1,2})일 [일월화수목금토]요일 \| (.+) \| 총 \d+건$/;
 
-/** 메시지의 머리글 후보: 본문 블록(v1.1.0), 첨부의 pretext(v1.1.0 전), 첨부 안 section 블록(지금) */
+/**
+ * 머리글의 캘린더 이름으로 연결을 찾습니다. Slack이 돌려주는 머리글에서는 이름 속 이모지가 ":orange_heart:" 같은
+ * 이름으로 바뀌어 있고 &·<·>는 &amp; 등으로 적혀 있어, 그대로 비교하지 않고 맞춘 뒤 비교합니다(앞뒤 공백 무시).
+ * 이모지 이름표를 받지 못했을 때를 위해, 마지막으로 이모지를 모두 뺀 이름끼리도 비교합니다.
+ */
+function findConnectionByName_(connections, headerName) {
+  const unescape = (t) => String(t).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  const same = (t) => unescape(emojiText_(t)).replace(/\s+/g, ' ').trim();
+  const bare = (t) => same(t)
+    .replace(new RegExp(EMOJI_NAME.source, 'g'), '')
+    .replace(/[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}️‍]/gu, '')
+    .replace(/\s+/g, ' ').trim();
+  const name = same(headerName);
+  const found = connections.find((c) => same(c.calendarName) === name);
+  if (found) return found;
+  const stripped = bare(headerName);
+  const candidates = connections.filter((c) => bare(c.calendarName) === stripped);
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+/** 메시지의 머리글 후보:본문 블록(v1.1.0), 첨부의 pretext(v1.1.0 전), 첨부 안 section 블록(지금) */
 function messageHeaders_(message) {
   const texts = [];
   const fromBlocks = (blocks) => (blocks || []).forEach((b) => {
@@ -3027,5 +3049,7 @@ function publishHome_(userId) {
   const installer = section_(meta.installer ? `●  <@${meta.installer}>` : '●  아직 없음');
   if (meta.installer === userId) installer.accessory = button_('변경', 'transfer_installer', 'installer');
   blocks.push(installer, { type: 'divider' });
+  // 지금 적용된 코드 버전: Apps Script에 새 버전을 배포했는지 확인할 때 봅니다.
+  blocks.push(context_(`Checky Bot v${VERSION}`));
   slackApi_('views.publish', { user_id: userId, view: { type: 'home', blocks } });
 }
