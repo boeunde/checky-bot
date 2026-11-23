@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.3.4
+ * checky-bot v1.3.5
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -36,7 +36,7 @@ const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 �
 
 const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
 // 앱 홈 맨 아래에 보여 주는 코드 버전. 맨 위 주석의 버전과 함께 올립니다.
-const VERSION = '1.3.4';
+const VERSION = '1.3.5';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -2212,6 +2212,7 @@ const LEAVE_GRACE = 30 * MINUTE; // 실행이 늦어져도 이 시간 안의 연
 const LEAVE_TABLE_ROWS = 99; // Slack 표는 머리글 포함 100줄까지입니다. 넘으면 메시지를 나눕니다.
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
+const SHEETS_MIME = 'application/vnd.google-apps.spreadsheet';
 // 사용률 색 점(leaveDot_). 연차가 1월 1일에 새로 생기는 회사 기준입니다.
 const LEAVE_COLOR_FROM = { m: 10, d: 15 }; // 이 날 전에 보내는 메시지는 모두 ⚪
 const LEAVE_RED_BELOW = 55; // % 미만 🔴
@@ -2349,8 +2350,23 @@ function postLeaveReport_(job, now) {
   if (job.userId) updateChannel_(job.chId, (c) => addLog_(c, job.userId, '연차 현황 채널에 발송'));
 }
 
+/** 읽을 수 있는 파일 종류: 'xlsx'(엑셀), 'sheet'(구글 스프레드시트), 그 밖은 null */
+function leaveFileKind_(mime, name) {
+  if (mime === SHEETS_MIME) return 'sheet';
+  if (mime === XLSX_MIME || /\.xlsx$/i.test(name)) return 'xlsx';
+  return null;
+}
+
+/** 구글 스프레드시트를 엑셀(.xlsx) 형식으로 내려받습니다. 드라이브 권한(DriveApp)으로 충분합니다. */
+function sheetAsXlsx_(fileId) {
+  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent(XLSX_MIME)}`;
+  const res = UrlFetchApp.fetch(url, { headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` }, muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) throw new Error(`구글 스프레드시트를 내려받지 못했습니다 (${res.getResponseCode()})`);
+  return res.getBlob();
+}
+
 /**
- * 폴더의 엑셀 파일을 모두 읽습니다. 하위 폴더는 보지 않고, 바로가기는 원본 파일을 읽습니다.
+ * 폴더의 엑셀 파일과 구글 스프레드시트를 모두 읽습니다. 하위 폴더는 보지 않고, 바로가기는 원본 파일을 읽습니다.
  * 같은 이름(D5)의 파일이 여러 개면 가장 최근에 수정된 파일을 씁니다.
  * 읽지 못했거나 양식이 다른 파일은 skipped에 이름을 모읍니다.
  */
@@ -2369,7 +2385,7 @@ function readLeaveFolder_(folderId) {
     const name = file.getName();
     if (file.getMimeType() === SHORTCUT_MIME) {
       // 바로가기는 원본 파일을 읽습니다. 원본도 공용 구글 계정에 공유돼 있어야 열 수 있습니다.
-      if (file.getTargetMimeType() !== XLSX_MIME && !/\.xlsx$/i.test(name)) continue;
+      if (!leaveFileKind_(file.getTargetMimeType(), name)) continue;
       try {
         file = DriveApp.getFileById(file.getTargetId());
       } catch (err) {
@@ -2377,10 +2393,13 @@ function readLeaveFolder_(folderId) {
         continue;
       }
     }
-    if (file.getMimeType() !== XLSX_MIME && !/\.xlsx$/i.test(name)) continue;
+    const kind = leaveFileKind_(file.getMimeType(), name);
+    if (!kind) continue;
     let row = null;
     try {
-      row = leaveRow_(xlsxCells_(file.getBlob(), Object.values(LEAVE_CELLS)));
+      // 구글 스프레드시트는 엑셀 형식으로 내려받아 엑셀과 똑같이 읽습니다.
+      const blob = kind === 'sheet' ? sheetAsXlsx_(file.getId()) : file.getBlob();
+      row = leaveRow_(xlsxCells_(blob, Object.values(LEAVE_CELLS)));
     } catch (err) {
       row = null;
     }
