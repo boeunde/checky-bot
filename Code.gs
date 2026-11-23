@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.3.3
+ * checky-bot v1.3.4
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -36,7 +36,7 @@ const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 �
 
 const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
 // 앱 홈 맨 아래에 보여 주는 코드 버전. 맨 위 주석의 버전과 함께 올립니다.
-const VERSION = '1.3.3';
+const VERSION = '1.3.4';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -2462,9 +2462,9 @@ function xmlUnescape_(text) {
     .replace(/&amp;/g, '&');
 }
 
-/** 3 → "3", 3.5 → "3.5", 62.456 → "62.5" */
+/** 자릿수를 고정합니다: (3, 2) → "3.00", (3.5, 2) → "3.50", (62.456, 1) → "62.5", (100, 1) → "100.0" */
 function formatLeaveNumber_(n, digits) {
-  return String(Math.round(n * 10 ** digits) / 10 ** digits);
+  return (Math.round(n * 10 ** digits) / 10 ** digits).toFixed(digits);
 }
 
 /** "오전 10시", "오후 2시 30분" */
