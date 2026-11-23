@@ -1667,10 +1667,10 @@ const tests = {
     // The last column spreads the unused days over the weeks left: Thursdays from today to 12/31 (11/26 ... 12/31 = 6).
     assert.deepStrictEqual(tableRows(post), [
       ['이름', '사용률', '남은 일수', '남은 주 당 사용 목표'],
-      ['김철수', '🔴 23.3%', '11.5일', '1.92일 / 주'],
-      ['박영희', '🟡 75%', '5일', '0.83일 / 주'],
+      ['김철수', '🔴 23.3%', '11.50일', '1.92일 / 주'],
+      ['박영희', '🟡 75.0%', '5.00일', '0.83일 / 주'],
       // 100% and over: no dot. A file named with 월차 has no weekly target.
-      ['이민수', '100%', '0일', '해당없음 / 월차'],
+      ['이민수', '100.0%', '0.00일', '해당없음 / 월차'],
     ]);
     // The caution sits right above the table, on two lines.
     assert.strictEqual(post.blocks[1].type, 'context');
@@ -1688,7 +1688,7 @@ const tests = {
     env.state.noTables = true;
     send('UA');
     env.run('dispatchDue');
-    assert.ok(env.posts('C1').at(-1).includes('이름  |  사용률  |  남은 일수  |  남은 주 당 사용 목표\n김철수  |  🔴 23.3%  |  11.5일  |  1.92일 / 주\n박영희  |  🟡 75%  |  5일  |  0.83일 / 주\n이민수  |  100%  |  0일  |  해당없음 / 월차'));
+    assert.ok(env.posts('C1').at(-1).includes('이름  |  사용률  |  남은 일수  |  남은 주 당 사용 목표\n김철수  |  🔴 23.3%  |  11.50일  |  1.92일 / 주\n박영희  |  🟡 75.0%  |  5.00일  |  0.83일 / 주\n이민수  |  100.0%  |  0.00일  |  해당없음 / 월차'));
 
     // A folder that can no longer be read: the admin who asked is told.
     delete env.state.folders.F1;
@@ -1705,11 +1705,11 @@ const tests = {
     send();
     env.run('dispatchDue');
     const before = env.rawPosts('C1').at(-1);
-    assert.deepStrictEqual(tableRows(before).slice(1).map((r) => r[1]), ['⚪ 23.3%', '⚪ 75%']);
+    assert.deepStrictEqual(tableRows(before).slice(1).map((r) => r[1]), ['⚪ 23.3%', '⚪ 75.0%']);
     env.setNow('2026-10-15T00:00');
     send();
     env.run('dispatchDue');
-    assert.deepStrictEqual(tableRows(env.rawPosts('C1').at(-1)).slice(1).map((r) => r[1]), ['🔴 23.3%', '🟡 75%']);
+    assert.deepStrictEqual(tableRows(env.rawPosts('C1').at(-1)).slice(1).map((r) => r[1]), ['🔴 23.3%', '🟡 75.0%']);
     // Weeks left count the weeks with a Thursday from today to 12/31; past the last Thursday, this week is the last one.
     const weeks = (iso) => env.sandbox.leaveWeeksLeft_(kst(iso));
     assert.deepStrictEqual([weeks('2026-11-23T10:00'), weeks('2026-12-24T10:00'), weeks('2026-12-25T10:00'), weeks('2026-12-31T10:00'), weeks('2027-12-31T10:00')], [6, 2, 1, 1, 1]);
