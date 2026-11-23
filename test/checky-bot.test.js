@@ -44,6 +44,8 @@ function createEnv(nowIso) {
     tz: 'Asia/Seoul',
     uuid: 0,
     apiCalls: [],
+    folders: {}, // Google Drive folders: { id: { name, files: [{ name, mime, updated, parts }] } }
+    driveFiles: {}, // files outside the folders, opened by id (shortcut targets the account can open)
   };
 
   const wrapEvent = (ev) => ({
@@ -94,6 +96,7 @@ function createEnv(nowIso) {
       case 'conversations.info':
         return state.members.has(params.channel) ? { ok: true, channel: { id: params.channel, is_member: true } } : { ok: false, error: 'channel_not_found' };
       case 'chat.postMessage':
+        if (state.noTables && (params.blocks || []).some((b) => b.type === 'table')) return { ok: false, error: 'invalid_blocks' };
         return state.failChannels[params.channel] ? { ok: false, error: state.failChannels[params.channel] } : { ok: true, ts: '1.1' };
       default:
         return { ok: true };
@@ -111,6 +114,17 @@ function createEnv(nowIso) {
     };
     return b;
   }
+
+  // A Drive file. A shortcut ({ shortcutTo: id }) has no content of its own; its target is opened by id.
+  const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const driveFile = (file) => ({
+    getName: () => file.name,
+    getMimeType: () => (file.shortcutTo ? 'application/vnd.google-apps.shortcut' : file.mime || xlsxMime),
+    getTargetId: () => file.shortcutTo || null,
+    getTargetMimeType: () => (file.shortcutTo ? file.targetMime || xlsxMime : null),
+    getLastUpdated: () => new MockDate(file.updated || 0),
+    getBlob: () => ({ parts: file.shortcutTo ? undefined : file.parts, setContentType() { return this; } }),
+  });
 
   const sandbox = {
     Date: MockDate,
@@ -161,6 +175,31 @@ function createEnv(nowIso) {
     Utilities: {
       getUuid: () => `conn${++state.uuid}-0000-0000`,
       base64EncodeWebSafe: (s) => Buffer.from(s, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_'),
+      // An .xlsx blob here carries its zip entries as { path: xml }; a blob without them is not a zip.
+      unzip: (blob) => {
+        if (!blob.parts) throw new Error('Could not unzip');
+        return Object.keys(blob.parts).map((name) => ({ getName: () => name, getDataAsString: () => blob.parts[name] }));
+      },
+    },
+    DriveApp: {
+      getFileById: (id) => {
+        if (!state.driveFiles[id]) throw new Error('No item with the given ID could be found, or you do not have permission to access it.');
+        return driveFile(state.driveFiles[id]);
+      },
+      getFolderById: (id) => {
+        const folder = state.folders[id];
+        if (!folder) throw new Error('No item with the given ID could be found, or you do not have permission to access it.');
+        return {
+          getName: () => folder.name,
+          getFiles: () => {
+            const files = folder.files.slice();
+            return {
+              hasNext: () => files.length > 0,
+              next: () => driveFile(files.shift()),
+            };
+          },
+        };
+      },
     },
     CalendarApp: {
       Visibility: { DEFAULT: 'DEFAULT', PRIVATE: 'PRIVATE', CONFIDENTIAL: 'CONFIDENTIAL', PUBLIC: 'PUBLIC' },
@@ -346,6 +385,54 @@ function blockAction(env, actionId, value, user = 'UA') {
   });
 }
 
+/**
+ * An .xlsx file as zip entries, laid out like Excel saves it: the first sheet found through workbook.xml and its rels,
+ * the name as a shared string (split in rich-text runs, with a phonetic run that is not part of the text),
+ * D10 as an inline string with a unit, and D11 as a formula with its saved result.
+ */
+function xlsxFile(name, granted, used, unused, extra = {}) {
+  const sheet = '<worksheet><sheetData>'
+    + '<row r="5"><c r="C5" t="s"><v>0</v></c><c r="D5" t="s"><v>1</v></c></row>'
+    + `<row r="9"><c r="D9" s="4"><v>${granted}</v></c></row>`
+    + `<row r="10"><c r="D10" t="inlineStr"><is><t>${used}일</t></is></c></row>`
+    + `<row r="11"><c r="D11" s="5"><f>D9-D10</f><v>${unused}</v></c></row>`
+    + '</sheetData></worksheet>';
+  const [first = '', ...rest] = Array.from(name);
+  return Object.assign({
+    name: `${name}.xlsx`,
+    parts: {
+      'xl/workbook.xml': '<workbook><sheets><sheet name="연차" sheetId="3" r:id="rId7"/></sheets></workbook>',
+      'xl/_rels/workbook.xml.rels': '<Relationships><Relationship Target="worksheets/sheet3.xml" Id="rId7" Type="worksheet"/></Relationships>',
+      'xl/sharedStrings.xml': `<sst><si><t>성명</t></si><si><r><t>${first}</t></r><r><t xml:space="preserve">${rest.join('')}</t></r><rPh sb="0" eb="1"><t>x</t></rPh></si></sst>`,
+      'xl/worksheets/sheet3.xml': sheet,
+    },
+  }, extra);
+}
+
+function leaveForm(folder, reminder = { enabled: false, sets: [{ id: 1, weeks: 2, time: 600 }] }) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const values = { leave_folder: { v: { value: folder } } };
+  if (reminder.enabled) {
+    reminder.sets.forEach((s) => {
+      values[`leave_${s.id}_weeks`] = { v: { selected_option: { value: String(s.weeks) } } };
+      values[`leave_${s.id}_time`] = { v: { selected_time: `${pad(Math.floor(s.time / 60))}:${pad(s.time % 60)}` } };
+    });
+  }
+  return { values, draft: { folder: '', reminder } };
+}
+
+function saveLeave(env, folder, reminder, user = 'UA') {
+  const { values, draft } = leaveForm(folder, reminder);
+  return env.interact({
+    type: 'view_submission',
+    user: { id: user },
+    view: { id: 'V7', callback_id: 'leave_settings', private_metadata: JSON.stringify({ channelId: 'C1', parentViewId: 'V1', draft }), state: { values } },
+  });
+}
+
+const tableRows = (params) => params.blocks.find((b) => b.type === 'table').rows
+  .map((row) => row.map((c) => (c.type === 'raw_text' ? c.text : c.elements[0].elements[0].text)));
+
 const actionIds = (view) => view.blocks.flatMap((b) => (b.elements || []).concat(b.accessory ? [b.accessory] : [])).map((e) => e.action_id).filter(Boolean);
 const response = (out) => JSON.parse(out.content);
 
@@ -405,7 +492,7 @@ const tests = {
     const [nonAdmin, admin] = env.calls('views.open').map((c) => c.params.view);
     assert.deepStrictEqual(actionIds(nonAdmin), []);
     assert.strictEqual(nonAdmin.blocks[1].text.text, '관리자: <@UA>', 'non-admins see who the admins are, without a button');
-    assert.deepStrictEqual(actionIds(admin).sort(), ['add_conn', 'change_calendar', 'conn_menu', 'edit_admins', 'edit_conn', 'test_conn', 'toggle_conn']);
+    assert.deepStrictEqual(actionIds(admin).sort(), ['add_conn', 'change_calendar', 'conn_menu', 'edit_admins', 'edit_conn', 'edit_leave', 'test_conn', 'toggle_conn']);
   },
 
   'non-admin button clicks are ignored': () => {
@@ -1526,6 +1613,136 @@ const tests = {
     const modal = env.calls('views.open')[0].params.view;
     assert.strictEqual(JSON.parse(modal.private_metadata).channelId, 'C1');
     assert.ok(actionIds(modal).includes('add_conn'));
+  },
+
+  '연차 현황: an admin links a Drive folder and sends one table of 이름 · 사용률 · 남은 일수 to the channel': () => {
+    const env = connectedEnv('2026-11-23T10:00');
+    env.state.folders.F1 = {
+      name: '2026 연차',
+      files: [
+        xlsxFile('박영희', 20, 0, 20, { updated: kst('2026-01-02T09:00') }),
+        xlsxFile('김철수', 15, 3.5, 11.5, { updated: kst('2026-11-20T09:00') }),
+        xlsxFile('박영희', 20, 15, 5, { name: '박영희 (최신).xlsx', updated: kst('2026-11-21T09:00') }),
+        { name: '안내.txt', mime: 'text/plain' },
+        { name: 'broken.xlsx' },
+        xlsxFile('', 15, 0, 15, { name: 'blank.xlsx' }),
+        // Shortcuts are followed to their original file, which must be shared with the account too.
+        { name: '이민수_2026_연차사용계획서.xlsx', shortcutTo: 'X1' },
+        { name: '최지은_2026_연차사용계획서.xlsx', shortcutTo: 'X2' },
+        { name: '회의록 바로가기', shortcutTo: 'X3', targetMime: 'application/vnd.google-apps.document' },
+      ],
+    };
+    env.state.driveFiles.X1 = xlsxFile('이민수', 10, 10, 0, { updated: kst('2026-11-01T09:00') });
+
+    // Only admins see the setting; non-admins see nothing until a folder is linked.
+    env.command({ user_id: 'UB', channel_id: 'C1' });
+    assert.ok(!JSON.stringify(env.calls('views.open')[0].params.view).includes('연차 현황'));
+    blockAction(env, 'edit_leave', 'leave');
+    const modal = env.calls('views.push').at(-1).params.view;
+    assert.strictEqual(modal.callback_id, 'leave_settings');
+    assert.ok(modal.blocks.find((b) => b.block_id === 'leave_folder').optional, 'the folder may be left blank while 연말 알림 is off');
+
+    assert.ok(response(saveLeave(env, 'not a link')).errors.leave_folder.includes('폴더 링크'));
+    assert.ok(response(saveLeave(env, 'https://drive.google.com/drive/folders/NOPE12345678')).errors.leave_folder.includes('열 수 없는 폴더'));
+    assert.ok(response(saveLeave(env, 'https://drive.google.com/drive/folders/F1', undefined, 'UB')).errors.leave_folder.includes('관리자만'));
+    assert.strictEqual(saveLeave(env, 'https://drive.google.com/drive/folders/F1?usp=sharing').content, '');
+    assert.strictEqual(env.channel('C1').leave.folderId, 'F1');
+    assert.strictEqual(env.channel('C1').leave.folderName, '2026 연차');
+    const settings = env.calls('views.update').at(-1).params.view;
+    assert.ok(blocksText(settings.blocks).some((t) => t.includes('<https://drive.google.com/drive/folders/F1|2026 연차>') && t.includes('연말 알림 X')));
+    assert.ok(actionIds(settings).includes('send_leave'));
+
+    // Sending asks first, then goes out on the next 1-minute run (reading many files can pass Slack's 3-second limit).
+    const send = (user) => env.interact({ type: 'view_submission', user: { id: user }, view: { id: 'V8', callback_id: 'leave_send', private_metadata: JSON.stringify({ channelId: 'C1', parentViewId: 'V1' }), state: { values: {} } } });
+    assert.ok(response(send('UB')).view.blocks[0].text.text.includes('관리자만'));
+    assert.ok(response(send('UA')).view.blocks[0].text.text.includes('1분 안에'));
+    send('UA');
+    assert.strictEqual(env.posts('C1').length, 0);
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 1, 'two requests in the same minute send once');
+    const post = env.rawPosts('C1')[0];
+    assert.strictEqual(post.text, '연차 현황 | 총 3명');
+    assert.strictEqual(post.blocks[0].text.text, '*연차 현황* | 11월 23일 월요일 기준 | 총 3명');
+    assert.deepStrictEqual(tableRows(post), [['이름', '사용률', '남은 일수'], ['김철수', '23.3%', '11.5일'], ['박영희', '75%', '5일'], ['이민수', '100%', '0일']]);
+    const notes = blocksText(post.blocks).at(-1);
+    assert.ok(notes.includes('이 데이터는 아직 시작되지 않은 일정이 계산에 포함될 수 있습니다. 오늘 오전 10시까지 등록이 완료된 일정을 기준으로 메시지가 작성됩니다.'), notes);
+    assert.ok(notes.includes('<https://drive.google.com/drive/folders/F1|2026 연차> 폴더의 엑셀 파일 기준'));
+    assert.ok(notes.includes('읽지 못한 파일 3개: blank.xlsx, broken.xlsx, 최지은_2026_연차사용계획서.xlsx (바로가기 원본을 열 수 없음)'), notes);
+    assert.strictEqual(env.channel('C1').log[0].text, '연차 현황 채널에 발송');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 1);
+
+    // Without table blocks, the same rows go out as text.
+    env.state.noTables = true;
+    send('UA');
+    env.run('dispatchDue');
+    assert.ok(env.posts('C1').at(-1).includes('김철수  |  23.3%  |  11.5일\n박영희  |  75%  |  5일\n이민수  |  100%  |  0일'));
+
+    // A folder that can no longer be read: the admin who asked is told.
+    delete env.state.folders.F1;
+    send('UA');
+    env.run('dispatchDue');
+    assert.ok(env.ephemerals('UA').at(-1).includes('연차 파일 폴더를 열 수 없습니다'));
+  },
+
+  '연차 현황 연말 알림: up to three, each N weeks before 12/31 at its own time, moved to Friday from a weekend': () => {
+    const env = connectedEnv('2026-11-23T10:00');
+    env.state.folders.F1 = { name: '연차', files: [xlsxFile('김철수', 15, 3.5, 11.5)] };
+    const link = 'https://drive.google.com/drive/folders/F1';
+
+    // The on/off and add/remove buttons redraw the screen, keeping what was typed.
+    const press = (actionId, value, values, draft) => env.interact({
+      type: 'block_actions',
+      user: { id: 'UA' },
+      view: { id: 'V7', private_metadata: JSON.stringify({ channelId: 'C1', parentViewId: 'V1', draft }), state: { values } },
+      actions: [{ action_id: actionId, value }],
+    });
+    press('toggle_leave', 'leave', { leave_folder: { v: { value: link } } });
+    let view = env.calls('views.update').at(-1).params.view;
+    assert.strictEqual(view.blocks.find((b) => b.block_id === 'leave_folder').element.initial_value, link);
+    assert.ok(!view.blocks.find((b) => b.block_id === 'leave_folder').optional);
+    press('add_leave_set', 'add', {}, JSON.parse(view.private_metadata).draft);
+    view = env.calls('views.update').at(-1).params.view;
+    const draft = JSON.parse(view.private_metadata).draft;
+    assert.deepStrictEqual(draft.reminder.sets.map((s) => s.weeks), [2, 1], 'a new reminder takes the nearest free week');
+    press('add_leave_set', 'add', {}, draft);
+    view = env.calls('views.update').at(-1).params.view;
+    assert.ok(!actionIds(view).includes('add_leave_set'), 'three at most');
+    press('remove_leave_set', '2', {}, JSON.parse(view.private_metadata).draft);
+    assert.deepStrictEqual(JSON.parse(env.calls('views.update').at(-1).params.view.private_metadata).draft.reminder.sets.map((s) => s.id), [1, 3]);
+
+    assert.ok(response(saveLeave(env, '', { enabled: true, sets: [{ id: 1, weeks: 2, time: 600 }] })).errors.leave_folder);
+    const twice = response(saveLeave(env, link, { enabled: true, sets: [{ id: 1, weeks: 5, time: 600 }, { id: 2, weeks: 5, time: 840 }] }));
+    assert.deepStrictEqual(Object.keys(twice.errors), ['leave_2_weeks']);
+    saveLeave(env, link, { enabled: true, sets: [{ id: 1, weeks: 2, time: 600 }, { id: 2, weeks: 5, time: 840 }] });
+    const line = blocksText(env.calls('views.update').at(-1).params.view.blocks).find((t) => t.includes('연말 알림 O'));
+    assert.ok(line.includes('연말 알림 O (12/31 5주 전: 11월 26일 (목) 오후 2:00, 12/31 2주 전: 12월 17일 (목) 오전 10:00)'), line);
+
+    env.setNow('2026-11-26T13:59');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 0);
+    env.setNow('2026-11-26T14:00');
+    env.run('dispatchDue');
+    env.setNow('2026-11-26T14:01');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 1);
+    const post = env.posts('C1')[0];
+    assert.ok(post.startsWith('*연말 연차 알림* | 11월 26일 목요일 기준 | 총 1명'), post);
+    assert.ok(post.includes('12월 31일까지 35일 남았습니다.'));
+    assert.ok(post.includes('오늘 오후 2시까지 등록이 완료된 일정을 기준으로'));
+
+    // A run late by more than 30 minutes skips the reminder.
+    env.setNow('2026-12-17T10:31');
+    env.run('dispatchDue');
+    assert.strictEqual(env.posts('C1').length, 1);
+
+    // 2028-12-31 is a Sunday: one week before is also a Sunday, so it goes out on Friday the 22nd.
+    assert.strictEqual(env.sandbox.formatDay_(env.sandbox.leaveReminderAt_({ weeks: 1, time: 600 }, 2028)), '12월 22일 (금)');
+
+    // Clearing the folder (with 연말 알림 off) unlinks it.
+    saveLeave(env, '');
+    assert.strictEqual(env.channel('C1').leave.folderId, null);
+    assert.strictEqual(env.channel('C1').log[0].text, '연차 파일 폴더 연결 끊기');
   },
 
   'only the installer can hand the installer role to someone else': () => {

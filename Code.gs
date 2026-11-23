@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.2.1
+ * checky-bot v1.3.1
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -36,7 +36,7 @@ const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 �
 
 const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
 // 앱 홈 맨 아래에 보여 주는 코드 버전. 맨 위 주석의 버전과 함께 올립니다.
-const VERSION = '1.2.1';
+const VERSION = '1.3.1';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -54,6 +54,7 @@ const HELP_TEXT = [
   '• `/checky today-all`: 오늘 일정을 채널에 보냅니다 (채널 관리자만).',
   '• 봇 메시지 지우기: 메시지의 ⋯ 메뉴 > Checky Bot 메시지 삭제 (채널 관리자만)',
   '• 하루 요약 다시 불러오기: 요약 메시지의 ⋯ 메뉴 > Checky Bot 일정 새로고침 (채널 관리자만)',
+  '• 연차 현황: `/checky` > 🏖️ 연차 현황에서 드라이브 폴더를 연결하고 채널에 보내거나 연말 알림을 켭니다 (채널 관리자만)',
 ].join('\n');
 
 // ─── 설치와 자동 실행 ─────────────────────────────────────
@@ -154,6 +155,11 @@ function runDispatchDue_() {
       failures.push(...dispatchChanges_(now));
     } catch (err) {
       failures.push(`변경 알림: ${err.message}`);
+    }
+    try {
+      failures.push(...dispatchLeave_(now));
+    } catch (err) {
+      failures.push(`연차 현황: ${err.message}`);
     }
     if (failures.length) console.error(failures.join('\n'));
   } finally {
@@ -938,6 +944,18 @@ function handleBlockAction_(payload, userId) {
   if (!chId) return;
   const ch = loadChannel_(chId);
   if (!isAdmin_(ch, userId)) return; // 관리자가 아니면 무시합니다.
+  if (['toggle_leave', 'add_leave_set', 'remove_leave_set'].includes(action.action_id)) {
+    editLeaveDraft_(payload, ch, chId, action);
+    return;
+  }
+  if (action.action_id === 'edit_leave') {
+    slackApi_('views.push', { trigger_id: payload.trigger_id, view: leaveModal_(chId, ch, view.id) });
+    return;
+  }
+  if (action.action_id === 'send_leave') {
+    slackApi_('views.push', { trigger_id: payload.trigger_id, view: leaveSendModal_(chId, view.id) });
+    return;
+  }
   if (['toggle_routine', 'pick_tab', 'add_change_set', 'remove_change_set'].includes(action.action_id)) {
     editDraft_(payload, ch, chId, action);
     return;
@@ -1012,7 +1030,8 @@ function handleSubmission_(payload, userId) {
     const ch = loadChannel_(meta.channelId);
     if (view.callback_id === 'disconnect') return submitDisconnect_(meta, ch, userId);
     if (view.callback_id === 'today_all') return submitTodayAll_(meta, userId);
-    const firstBlock = { add_conn: 'calendar_id', change_calendar: 'calendar_id', conn_settings: 'notice', admins: 'admins' }[view.callback_id];
+    if (view.callback_id === 'leave_send') return submitLeaveSend_(meta, ch, userId);
+    const firstBlock = { add_conn: 'calendar_id', change_calendar: 'calendar_id', conn_settings: 'notice', admins: 'admins', leave_settings: 'leave_folder' }[view.callback_id];
     if (!firstBlock) return null;
     if (!isAdmin_(ch, userId)) {
       if (view.callback_id === 'conn_settings') return json_({ response_action: 'update', view: noticeModal_('알림 설정', '이 채널의 관리자만 바꿀 수 있습니다.') });
@@ -1021,11 +1040,12 @@ function handleSubmission_(payload, userId) {
     if (view.callback_id === 'add_conn') return submitAddConn_(meta, ch, values, userId);
     if (view.callback_id === 'conn_settings') return submitConnSettings_(meta, ch, values, userId);
     if (view.callback_id === 'change_calendar') return submitChangeCalendar_(meta, ch, values, userId);
+    if (view.callback_id === 'leave_settings') return submitLeaveSettings_(meta, ch, values, userId);
     return submitAdmins_(meta, ch, values, userId);
   } catch (err) {
     console.error(err && err.stack ? err.stack : err);
     if (view.callback_id === 'conn_settings') return json_({ response_action: 'update', view: noticeModal_('알림 설정', `처리하지 못했습니다: ${err.message}`) });
-    const block = { add_conn: 'calendar_id', change_calendar: 'calendar_id', admins: 'admins', installer: 'installer' }[view.callback_id];
+    const block = { add_conn: 'calendar_id', change_calendar: 'calendar_id', admins: 'admins', installer: 'installer', leave_settings: 'leave_folder' }[view.callback_id];
     return block ? errorsJson_({ [block]: `처리하지 못했습니다: ${err.message}` }) : null;
   }
 }
@@ -2178,6 +2198,478 @@ function deleteChunked_(key) {
   props.deleteProperty(`${key}#n`);
 }
 
+// ─── 연차 현황 ───────────────────────────────────────────
+// 채널마다 구글 드라이브 폴더 하나를 연결합니다. 폴더 안의 엑셀(.xlsx) 파일은 모두 같은 양식이며,
+// 파일마다 이름과 발생·사용·미사용 연차일수를 읽어 표 하나로 채널에 보냅니다.
+// 엑셀은 봇이 직접 압축을 풀어 읽습니다(드라이브 읽기 권한만 필요하고, 변환 사본을 만들지 않습니다).
+// 보내기는 채널 관리자가 [채널에 보내기]로 하거나, 연말 알림(12월 31일 N주 전, 최대 3개)으로 합니다.
+// 파일이 많으면 Slack의 3초 응답 제한을 넘길 수 있어, 둘 다 1분마다 도는 dispatchDue에서 보냅니다.
+
+const LEAVE_CELLS = { name: 'D5', granted: 'D9', used: 'D10', unused: 'D11' };
+const LEAVE_WEEKS = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+const LEAVE_SET_LIMIT = 3;
+const LEAVE_GRACE = 30 * MINUTE; // 실행이 늦어져도 이 시간 안의 연말 알림은 보냅니다.
+const LEAVE_TABLE_ROWS = 99; // Slack 표는 머리글 포함 100줄까지입니다. 넘으면 메시지를 나눕니다.
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
+
+function defaultLeaveSet_(id, weeks) {
+  return { id, weeks: weeks || 2, time: 10 * 60 };
+}
+
+/** 채널의 연차 현황 설정. 저장된 적이 없으면 기본값입니다. */
+function leaveOf_(ch) {
+  const saved = (ch && ch.leave) || {};
+  const reminder = saved.reminder || {};
+  const sets = (reminder.sets && reminder.sets.length ? reminder.sets : [defaultLeaveSet_(1)])
+    .map((s) => ({ id: s.id, weeks: s.weeks, time: s.time }));
+  return {
+    folderId: saved.folderId || null,
+    folderName: saved.folderName || null,
+    reminder: { enabled: !!reminder.enabled, sets },
+    updatedAt: saved.updatedAt || 0,
+  };
+}
+
+function folderUrl_(folderId) {
+  return `https://drive.google.com/drive/folders/${folderId}`;
+}
+
+/** 폴더 링크나 ID에서 폴더 ID를 꺼냅니다. 알아볼 수 없으면 null. */
+function folderIdFrom_(text) {
+  const value = String(text || '').trim();
+  const match = /\/folders\/([\w-]+)/.exec(value) || /[?&]id=([\w-]+)/.exec(value) || /^([\w-]{10,})$/.exec(value);
+  return match ? match[1] : null;
+}
+
+/** 그해 12월 31일 N주 전의 알림 시각. 그날이 주말이면 그 전 금요일에 보냅니다. */
+function leaveReminderAt_(set, year) {
+  let day = Date.parse(`${year}-12-31T00:00:00+09:00`) - set.weeks * 7 * DAY;
+  const dow = kstParts_(day).dow;
+  if (dow === 6) day -= DAY;
+  if (dow === 0) day -= 2 * DAY;
+  return day + set.time * MINUTE;
+}
+
+/** "12/31 2주 전" */
+function leaveWeeksLabel_(weeks) {
+  return `12/31 ${weeks}주 전`;
+}
+
+/** "🏖️ 연차 현황  |  📁 폴더  |  연말 알림 O (12/31 2주 전: 12월 17일 (목) 오전 10:00, ...)" 아래 회색 줄 */
+function describeLeave_(leave, now) {
+  if (!leave.folderId) return '연차 파일 폴더가 연결되지 않았습니다.';
+  const folder = `📁 <${folderUrl_(leave.folderId)}|${escapeSlack_(leave.folderName || '연차 폴더')}>`;
+  if (!leave.reminder.enabled) return [folder, '연말 알림 X'].join(SEP);
+  const year = kstParts_(now).y;
+  const sets = leave.reminder.sets
+    .slice()
+    .sort((a, b) => b.weeks - a.weeks)
+    .map((s) => {
+      const at = leaveReminderAt_(s, year);
+      return `${leaveWeeksLabel_(s.weeks)}: ${formatDay_(at)} ${formatAmPm_(s.time)}`;
+    });
+  return [folder, `연말 알림 O (${sets.join(', ')})`].join(SEP);
+}
+
+/** 1분마다: 연말 알림 시각이 된 채널과, [채널에 보내기]로 요청된 채널에 연차 현황을 보냅니다. */
+function dispatchLeave_(now) {
+  const failures = [];
+  const jobs = takeLeaveQueue_();
+  const year = kstParts_(now).y;
+  const sent = loadSent_(now);
+  let marked = false;
+  loadMeta_().channels.forEach((chId) => {
+    const ch = loadChannel_(chId);
+    if (!ch || !ch.leave) return;
+    const leave = leaveOf_(ch);
+    if (!leave.folderId || !leave.reminder.enabled) return;
+    leave.reminder.sets.forEach((s) => {
+      const at = leaveReminderAt_(s, year);
+      const key = `l|${chId}|${year}|${s.weeks}`;
+      // 설정을 바꾸기 전 시각의 알림은 보내지 않습니다.
+      if (at > now || now > at + LEAVE_GRACE || at < leave.updatedAt || sent[key]) return;
+      sent[key] = at + 2 * DAY;
+      marked = true;
+      if (!jobs.some((j) => j.chId === chId && j.weeks === s.weeks)) jobs.push({ chId, weeks: s.weeks });
+    });
+  });
+  // 같은 알림을 다시 보내지 않도록, 읽기에 실패해도 보낸 것으로 적어 둡니다(실패는 설치자에게 알립니다).
+  if (marked) saveJson_('SENT', sent);
+  jobs.forEach((job) => {
+    try {
+      postLeaveReport_(job, now);
+    } catch (err) {
+      failures.push(`연차 현황 ${job.chId}: ${err.message}`);
+      const text = `:warning: <#${job.chId}> 채널에 연차 현황을 보내지 못했습니다: ${err.message}`;
+      if (job.userId) postEphemeral_(job.chId, job.userId, text);
+      if (err.slackError) handleSendFailure_(job.chId, err);
+      else if (!job.userId) notifyInstallerOnce_(`leave|${job.chId}|${err.message}`, text);
+    }
+  });
+  return failures;
+}
+
+/** [채널에 보내기]: 다음 1분 실행 때 보내도록 요청을 적어 둡니다. 같은 채널의 요청이 이미 있으면 하나로 칩니다. */
+function queueLeaveReport_(chId, userId) {
+  withLock_(() => {
+    const queue = loadJson_('LEAVE_QUEUE', []);
+    if (!queue.some((j) => j.chId === chId && !j.weeks)) queue.push({ chId, userId });
+    saveJson_('LEAVE_QUEUE', queue);
+  });
+}
+
+function takeLeaveQueue_() {
+  if (!PropertiesService.getScriptProperties().getProperty('LEAVE_QUEUE')) return [];
+  return withLock_(() => {
+    const queue = loadJson_('LEAVE_QUEUE', []);
+    PropertiesService.getScriptProperties().deleteProperty('LEAVE_QUEUE');
+    return queue;
+  });
+}
+
+function postLeaveReport_(job, now) {
+  const ch = loadChannel_(job.chId);
+  const leave = leaveOf_(ch);
+  if (!ch || !leave.folderId) throw new Error('연차 파일 폴더가 연결되지 않았습니다.');
+  const report = readLeaveFolder_(leave.folderId);
+  leaveMessages_(report, now, job.weeks).forEach((m) => {
+    try {
+      postMessage_(job.chId, m.text, null, m.blocks);
+    } catch (err) {
+      // 표(table) 블록을 받지 않는 경우에 대비해 글자 표로 다시 보냅니다.
+      if (err.slackError !== 'invalid_blocks') throw err;
+      postMessage_(job.chId, m.text, null, m.plainBlocks);
+    }
+  });
+  if (job.userId) updateChannel_(job.chId, (c) => addLog_(c, job.userId, '연차 현황 채널에 발송'));
+}
+
+/**
+ * 폴더의 엑셀 파일을 모두 읽습니다. 하위 폴더는 보지 않고, 바로가기는 원본 파일을 읽습니다.
+ * 같은 이름(D5)의 파일이 여러 개면 가장 최근에 수정된 파일을 씁니다.
+ * 읽지 못했거나 양식이 다른 파일은 skipped에 이름을 모읍니다.
+ */
+function readLeaveFolder_(folderId) {
+  let folder;
+  try {
+    folder = DriveApp.getFolderById(folderId);
+  } catch (err) {
+    throw new Error(`공용 구글 계정(${accountEmail_()})이 연차 파일 폴더를 열 수 없습니다. 폴더 공유를 확인하세요.`);
+  }
+  const byName = {};
+  const skipped = [];
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    let file = files.next();
+    const name = file.getName();
+    if (file.getMimeType() === SHORTCUT_MIME) {
+      // 바로가기는 원본 파일을 읽습니다. 원본도 공용 구글 계정에 공유돼 있어야 열 수 있습니다.
+      if (file.getTargetMimeType() !== XLSX_MIME && !/\.xlsx$/i.test(name)) continue;
+      try {
+        file = DriveApp.getFileById(file.getTargetId());
+      } catch (err) {
+        skipped.push(`${name} (바로가기 원본을 열 수 없음)`);
+        continue;
+      }
+    }
+    if (file.getMimeType() !== XLSX_MIME && !/\.xlsx$/i.test(name)) continue;
+    let row = null;
+    try {
+      row = leaveRow_(xlsxCells_(file.getBlob(), Object.values(LEAVE_CELLS)));
+    } catch (err) {
+      row = null;
+    }
+    if (!row) {
+      skipped.push(name);
+      continue;
+    }
+    row.updated = file.getLastUpdated().getTime();
+    const prev = byName[row.name];
+    if (!prev || prev.updated < row.updated) byName[row.name] = row;
+  }
+  const rows = Object.keys(byName).map((k) => byName[k]).sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+  return { folderId, folderName: folder.getName(), rows, skipped: skipped.sort() };
+}
+
+/** 셀 값에서 숫자를 꺼냅니다: 15, "15일", "3.5일" → 15, 15, 3.5. 숫자가 없으면 null. */
+function leaveNumber_(value) {
+  const match = /-?\d+(?:\.\d+)?/.exec(String(value === undefined || value === null ? '' : value).replace(/,/g, ''));
+  return match ? Math.round(Number(match[0]) * 100) / 100 : null;
+}
+
+/** 엑셀 칸 값 → { name, granted, used, unused, rate }. 이름이나 발생 연차가 없으면 양식이 다른 파일로 보고 null. */
+function leaveRow_(cells) {
+  const name = String(cells[LEAVE_CELLS.name] || '').replace(/\s+/g, ' ').trim();
+  const granted = leaveNumber_(cells[LEAVE_CELLS.granted]);
+  if (!name || granted === null) return null;
+  const used = leaveNumber_(cells[LEAVE_CELLS.used]) || 0;
+  let unused = leaveNumber_(cells[LEAVE_CELLS.unused]);
+  if (unused === null) unused = Math.round((granted - used) * 100) / 100;
+  return { name, granted, used, unused, rate: granted > 0 ? (used / granted) * 100 : null };
+}
+
+/**
+ * .xlsx 파일의 첫 번째 시트에서 칸 값을 읽습니다. xlsx는 XML 파일을 묶은 zip입니다.
+ * 수식 칸은 엑셀이 마지막으로 저장한 결과 값을 읽습니다.
+ */
+function xlsxCells_(blob, refs) {
+  const parts = {};
+  Utilities.unzip(blob.setContentType('application/zip')).forEach((b) => { parts[b.getName()] = b; });
+  const read = (name) => (parts[name] ? parts[name].getDataAsString('UTF-8') : '');
+  let sheetPath = 'xl/worksheets/sheet1.xml';
+  const first = /<sheet\b[^>]*\s\w+:id="([^"]+)"/.exec(read('xl/workbook.xml'));
+  if (first) {
+    const rel = new RegExp(`<Relationship\\b[^>]*\\sId="${first[1]}"[^>]*>`).exec(read('xl/_rels/workbook.xml.rels'));
+    const target = rel && /\sTarget="([^"]+)"/.exec(rel[0]);
+    if (target) sheetPath = target[1].charAt(0) === '/' ? target[1].slice(1) : `xl/${target[1].replace(/^\.\//, '')}`;
+  }
+  const sheet = read(sheetPath);
+  if (!sheet) throw new Error('시트를 찾지 못했습니다.');
+  const shared = [];
+  read('xl/sharedStrings.xml').replace(/<si\b[^>]*>([\s\S]*?)<\/si>/g, (all, si) => { shared.push(xmlText_(si)); return ''; });
+  const cells = {};
+  refs.forEach((ref) => {
+    const match = new RegExp(`(<c\\b[^>]*\\sr="${ref}"[^>]*?)(?:/>|>([\\s\\S]*?)</c>)`).exec(sheet);
+    if (!match) return;
+    const type = (/\st="([^"]+)"/.exec(match[1]) || [])[1];
+    const body = match[2] || '';
+    const v = /<v>([\s\S]*?)<\/v>/.exec(body);
+    if (type === 's') cells[ref] = v ? shared[Number(v[1])] : '';
+    else if (type === 'inlineStr') cells[ref] = xmlText_(body);
+    else cells[ref] = v ? xmlUnescape_(v[1]) : '';
+  });
+  return cells;
+}
+
+/** 공유 문자열·인라인 문자열의 글자(<t>)를 이어 붙입니다. 윗주(<rPh>)는 뺍니다. */
+function xmlText_(xml) {
+  const parts = [];
+  xml.replace(/<rPh\b[\s\S]*?<\/rPh>/g, '').replace(/<t\b[^>]*>([\s\S]*?)<\/t>/g, (all, t) => { parts.push(xmlUnescape_(t)); return ''; });
+  return parts.join('');
+}
+
+function xmlUnescape_(text) {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (all, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (all, d) => String.fromCodePoint(Number(d)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/** 3 → "3", 3.5 → "3.5", 62.456 → "62.5" */
+function formatLeaveNumber_(n, digits) {
+  return String(Math.round(n * 10 ** digits) / 10 ** digits);
+}
+
+/** "오전 10시", "오후 2시 30분" */
+function formatHour_(minutes) {
+  const hour = Math.floor(minutes / 60) % 12 || 12;
+  const minute = minutes % 60;
+  return `${minutes >= 12 * 60 ? '오후' : '오전'} ${hour}시${minute ? ` ${minute}분` : ''}`;
+}
+
+/**
+ * 연차 현황 메시지: 머리글 + 표(이름 | 사용률 | 남은 일수) + 회색 안내 줄.
+ * plainBlocks는 표 블록을 쓸 수 없을 때 보낼 글자 표입니다.
+ */
+function leaveMessages_(report, now, weeks) {
+  const day = kstDayStart_(now);
+  const title = weeks ? '연말 연차 알림' : '연차 현황';
+  const rows = report.rows;
+  const notes = [];
+  if (weeks) {
+    const left = Math.round((Date.parse(`${kstParts_(now).y}-12-31T00:00:00+09:00`) - day) / DAY);
+    notes.push(left > 0 ? `12월 31일까지 ${left}일 남았습니다.` : '오늘이 올해 마지막 날입니다.');
+  }
+  // 엑셀에는 앞으로 쓸 연차를 미리 적어 둘 수 있어, 읽은 시각을 기준으로 밝힙니다.
+  notes.push(`이 데이터는 아직 시작되지 않은 일정이 계산에 포함될 수 있습니다. 오늘 ${formatHour_(kstParts_(now).minutes)}까지 등록이 완료된 일정을 기준으로 메시지가 작성됩니다.`);
+  notes.push(`<${folderUrl_(report.folderId)}|${escapeSlack_(report.folderName)}> 폴더의 엑셀 파일 기준 (사용률 = 사용 ÷ 발생)`);
+  if (report.skipped.length) notes.push(`:warning: 읽지 못한 파일 ${report.skipped.length}개: ${report.skipped.map(escapeSlack_).join(', ')}`);
+  const header = `*${title}* | ${formatDayLong_(day)} 기준 | 총 ${rows.length}명`;
+  const text = `${title} | 총 ${rows.length}명`;
+  if (!rows.length) {
+    const blocks = [section_(header), section_('폴더에서 읽을 수 있는 연차 파일이 없습니다.'), context_(notes.join('\n'))];
+    return [{ text, blocks, plainBlocks: blocks }];
+  }
+  const rate = (r) => (r.rate === null ? '-' : `${formatLeaveNumber_(r.rate, 1)}%`);
+  const left = (r) => `${formatLeaveNumber_(r.unused, 2)}일`;
+  const messages = [];
+  for (let i = 0; i < rows.length; i += LEAVE_TABLE_ROWS) {
+    const chunk = rows.slice(i, i + LEAVE_TABLE_ROWS);
+    const head = i === 0 ? header : `${header} (이어서)`;
+    const cell = (value) => ({ type: 'raw_text', text: value });
+    const bold = (value) => ({ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: value, style: { bold: true } }] }] });
+    const table = {
+      type: 'table',
+      column_settings: [{ align: 'left' }, { align: 'right' }, { align: 'right' }],
+      rows: [[bold('이름'), bold('사용률'), bold('남은 일수')]].concat(chunk.map((r) => [cell(r.name), cell(rate(r)), cell(left(r))])),
+    };
+    const lines = chunk.map((r) => `${r.name}  |  ${rate(r)}  |  ${left(r)}`);
+    const footer = i + LEAVE_TABLE_ROWS >= rows.length ? [context_(notes.join('\n'))] : [];
+    messages.push({
+      text,
+      blocks: [section_(head), table].concat(footer),
+      plainBlocks: [section_(head), section_(`이름  |  사용률  |  남은 일수\n${lines.join('\n')}`)].concat(footer),
+    });
+  }
+  return messages;
+}
+
+// ─── 연차 현황 화면 ───────────────────────────────────────
+
+/** 채널 설정 화면의 연차 현황 칸 */
+function leaveBlocks_(chId, ch, admin) {
+  const leave = leaveOf_(ch);
+  if (!admin && !leave.folderId) return [];
+  const head = section_('*🏖️ 연차 현황*');
+  if (admin) head.accessory = button_('⚙️ 설정', 'edit_leave', 'leave');
+  const blocks = [head, context_(describeLeave_(leave, Date.now()))];
+  if (admin && leave.folderId) blocks.push({ type: 'actions', elements: [button_('채널에 보내기', 'send_leave', 'send')] });
+  blocks.push({ type: 'divider' });
+  return blocks;
+}
+
+/** 연차 현황 설정 화면. draft는 저장 전 고른 값입니다(켜기/끄기와 알림 추가·삭제는 버튼이라 다시 그립니다). */
+function leaveModal_(chId, ch, parentViewId, draft) {
+  const leave = leaveOf_(ch);
+  draft = draft || { folder: leave.folderId ? folderUrl_(leave.folderId) : '', reminder: leave.reminder };
+  const r = draft.reminder;
+  const weeks = LEAVE_WEEKS.map((w) => option_(leaveWeeksLabel_(w), w));
+  const folder = { type: 'plain_text_input', placeholder: plain_('구글 드라이브 폴더 링크') };
+  if (draft.folder) folder.initial_value = draft.folder;
+  const blocks = [
+    section_(`<#${chId}>에 보낼 연차 현황을 설정합니다.`),
+    input_('leave_folder', '연차 파일 폴더', folder, !r.enabled),
+    context_(`폴더를 공용 구글 계정 *${accountEmail_()}* 에 공유한 뒤 폴더 링크를 넣으세요. 폴더 안의 엑셀(.xlsx) 파일마다 D5 이름, D9 발생, D10 사용, D11 미사용 연차일수를 읽습니다. 같은 이름의 파일이 여러 개면 가장 최근에 수정한 파일을 씁니다. 비워 두고 저장하면 연결을 끊습니다.`),
+    { type: 'divider' },
+    routineHeader_('leave', '*연말 알림*\n12월 31일을 앞두고 정한 날에 연차 현황을 채널에 보냅니다. 그날이 주말이면 그 전 금요일에 보냅니다.', r.enabled),
+  ];
+  blocks[blocks.length - 1].accessory.action_id = 'toggle_leave';
+  if (r.enabled) {
+    r.sets.forEach((s, i) => {
+      const p = `leave_${s.id}`;
+      const head = section_(`*알림 ${i + 1}*`);
+      head.block_id = `${p}_set`;
+      if (i > 0) head.accessory = button_('삭제', 'remove_leave_set', s.id);
+      blocks.push(
+        { type: 'divider' },
+        head,
+        input_(`${p}_weeks`, '보내는 날', select_(weeks, s.weeks)),
+        timePicker_(`${p}_time`, '보내는 시각', s.time),
+      );
+    });
+    if (r.sets.length < LEAVE_SET_LIMIT) {
+      blocks.push({ type: 'divider' }, { type: 'actions', block_id: 'leave_add_set', elements: [button_('+ 알림 추가', 'add_leave_set', 'add')] });
+    }
+  }
+  return {
+    type: 'modal',
+    callback_id: 'leave_settings',
+    title: plain_('연차 현황'),
+    submit: plain_('저장'),
+    close: plain_('취소'),
+    private_metadata: JSON.stringify({ channelId: chId, parentViewId, draft }),
+    blocks,
+  };
+}
+
+/** 연차 현황 설정 화면에서 지금 고른 값 */
+function leaveDraftFromView_(meta, values, ch) {
+  const leave = leaveOf_(ch);
+  const draft = JSON.parse(JSON.stringify(meta.draft || { folder: leave.folderId ? folderUrl_(leave.folderId) : '', reminder: leave.reminder }));
+  const folder = values && values.leave_folder && values.leave_folder.v;
+  if (folder) draft.folder = (folder.value || '').trim();
+  draft.reminder.sets.forEach((s) => {
+    const p = `leave_${s.id}`;
+    const w = values && values[`${p}_weeks`] && values[`${p}_weeks`].v.selected_option;
+    if (w) s.weeks = Number(w.value);
+    s.time = pickedTime_(values || {}, `${p}_time`, s.time);
+  });
+  return draft;
+}
+
+/** 켜짐/꺼짐, 알림 추가·삭제: 화면만 다시 그립니다. 저장은 [저장]을 눌러야 됩니다. */
+function editLeaveDraft_(payload, ch, chId, action) {
+  const view = payload.view;
+  const meta = JSON.parse(view.private_metadata || '{}');
+  const draft = leaveDraftFromView_(meta, view.state && view.state.values, ch);
+  const sets = draft.reminder.sets;
+  if (action.action_id === 'toggle_leave') {
+    draft.reminder.enabled = !draft.reminder.enabled;
+  } else if (action.action_id === 'add_leave_set') {
+    if (sets.length >= LEAVE_SET_LIMIT) return;
+    // 새 알림은 아직 고르지 않은 주 가운데 12/31에 가장 가까운 주로 둡니다.
+    const free = LEAVE_WEEKS.slice().reverse().find((w) => !sets.some((s) => s.weeks === w));
+    sets.push(defaultLeaveSet_(Math.max(...sets.map((s) => s.id)) + 1, free));
+  } else if (action.action_id === 'remove_leave_set') {
+    draft.reminder.sets = sets.filter((s, i) => i === 0 || String(s.id) !== String(action.value));
+  }
+  updateView_(view.id, leaveModal_(chId, ch, meta.parentViewId, draft));
+}
+
+function submitLeaveSettings_(meta, ch, values, userId) {
+  const draft = leaveDraftFromView_(meta, values, ch);
+  const r = draft.reminder;
+  const errors = {};
+  let folderId = null;
+  let folderName = null;
+  if (draft.folder) {
+    folderId = folderIdFrom_(draft.folder);
+    if (!folderId) {
+      errors.leave_folder = '구글 드라이브 폴더 링크를 넣으세요. 예: https://drive.google.com/drive/folders/...';
+    } else {
+      try {
+        folderName = DriveApp.getFolderById(folderId).getName();
+      } catch (err) {
+        errors.leave_folder = `공용 구글 계정(${accountEmail_()})이 열 수 없는 폴더입니다. 폴더를 이 계정에 공유했는지, 링크가 맞는지 확인하세요.`;
+      }
+    }
+  } else if (r.enabled) {
+    errors.leave_folder = '연말 알림을 켜려면 폴더 링크를 넣으세요.';
+  }
+  if (r.enabled) {
+    r.sets.forEach((s, i) => {
+      if (r.sets.slice(0, i).some((x) => x.weeks === s.weeks)) errors[`leave_${s.id}_weeks`] = '다른 알림과 같은 날입니다.';
+    });
+  }
+  if (Object.keys(errors).length) return errorsJson_(errors);
+  updateChannel_(meta.channelId, (c) => {
+    c.leave = {
+      folderId,
+      folderName,
+      reminder: { enabled: r.enabled, sets: r.sets.map((s) => ({ id: s.id, weeks: s.weeks, time: s.time })) },
+      updatedAt: Date.now(),
+    };
+    addLog_(c, userId, folderId ? '연차 현황 설정 변경' : '연차 파일 폴더 연결 끊기');
+  });
+  refreshParent_(meta.parentViewId, meta.channelId, userId);
+  return null;
+}
+
+function leaveSendModal_(chId, parentViewId) {
+  return {
+    type: 'modal',
+    callback_id: 'leave_send',
+    title: plain_('연차 현황 발송'),
+    submit: plain_('발송'),
+    close: plain_('취소'),
+    private_metadata: JSON.stringify({ channelId: chId, parentViewId }),
+    blocks: [
+      section_(`<#${chId}>에 연차 현황을 발송하시겠습니까?`),
+      context_('폴더의 엑셀 파일을 읽어 1분 안에 보냅니다.'),
+    ],
+  };
+}
+
+function submitLeaveSend_(meta, ch, userId) {
+  const title = '연차 현황 발송';
+  if (!isAdmin_(ch, userId)) return json_({ response_action: 'update', view: noticeModal_(title, '이 채널의 관리자만 보낼 수 있습니다.') });
+  if (!leaveOf_(ch).folderId) return json_({ response_action: 'update', view: noticeModal_(title, '연차 파일 폴더가 연결되지 않았습니다.') });
+  queueLeaveReport_(meta.channelId, userId);
+  return json_({ response_action: 'update', view: noticeModal_(title, `엑셀 파일을 읽고 있습니다. 1분 안에 <#${meta.channelId}>에 보냅니다.`) });
+}
+
 // ─── 장애 처리 ────────────────────────────────────────────
 
 function setConnectionError_(chId, conn, error) {
@@ -2704,6 +3196,9 @@ function channelModal_(chId, userId) {
     }
     blocks.push({ type: 'divider' });
   });
+
+  // 캘린더 연결 아래에 연차 현황 칸을 둡니다(관리자이거나 폴더가 연결된 경우).
+  blocks.push(...leaveBlocks_(chId, ch, admin));
 
   // 연결 목록은 구분선으로 끝나므로, 변경사항은 바로 이어 붙입니다.
   if (ch.log.length) {
