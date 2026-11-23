@@ -1663,9 +1663,20 @@ const tests = {
     const post = env.rawPosts('C1')[0];
     assert.strictEqual(post.text, '연차 현황 | 총 3명');
     assert.strictEqual(post.blocks[0].text.text, '*연차 현황* | 11월 23일 월요일 기준 | 총 3명');
-    assert.deepStrictEqual(tableRows(post), [['이름', '사용률', '남은 일수'], ['김철수', '23.3%', '11.5일'], ['박영희', '75%', '5일'], ['이민수', '100%', '0일']]);
+    // From October 15: under 55% red, 55-80% yellow, 80% and over white (neutral).
+    // The last column spreads the unused days over the weeks left: Thursdays from today to 12/31 (11/26 ... 12/31 = 6).
+    assert.deepStrictEqual(tableRows(post), [
+      ['이름', '사용률', '남은 일수', '남은 주 당 사용 목표'],
+      ['김철수', '🔴 23.3%', '11.5일', '1.92일 / 주'],
+      ['박영희', '🟡 75%', '5일', '0.83일 / 주'],
+      ['이민수', '⚪ 100%', '0일', '0일 / 주'],
+    ]);
+    // The caution sits right above the table, on two lines.
+    assert.strictEqual(post.blocks[1].type, 'context');
+    assert.strictEqual(blocksText(post.blocks)[1], '이 데이터는 아직 시작되지 않은 일정이 계산에 포함될 수 있습니다.\n오늘 오전 10시까지 등록이 완료된 일정을 기준으로 메시지가 작성됩니다.');
+    assert.strictEqual(post.blocks[2].type, 'table');
     const notes = blocksText(post.blocks).at(-1);
-    assert.ok(notes.includes('이 데이터는 아직 시작되지 않은 일정이 계산에 포함될 수 있습니다. 오늘 오전 10시까지 등록이 완료된 일정을 기준으로 메시지가 작성됩니다.'), notes);
+    assert.ok(!notes.includes('55% 미만'), 'no color legend under the table');
     assert.ok(notes.includes('<https://drive.google.com/drive/folders/F1|2026 연차> 폴더의 엑셀 파일 기준'));
     assert.ok(notes.includes('읽지 못한 파일 3개: blank.xlsx, broken.xlsx, 최지은_2026_연차사용계획서.xlsx (바로가기 원본을 열 수 없음)'), notes);
     assert.strictEqual(env.channel('C1').log[0].text, '연차 현황 채널에 발송');
@@ -1676,13 +1687,33 @@ const tests = {
     env.state.noTables = true;
     send('UA');
     env.run('dispatchDue');
-    assert.ok(env.posts('C1').at(-1).includes('김철수  |  23.3%  |  11.5일\n박영희  |  75%  |  5일\n이민수  |  100%  |  0일'));
+    assert.ok(env.posts('C1').at(-1).includes('이름  |  사용률  |  남은 일수  |  남은 주 당 사용 목표\n김철수  |  🔴 23.3%  |  11.5일  |  1.92일 / 주\n박영희  |  🟡 75%  |  5일  |  0.83일 / 주\n이민수  |  ⚪ 100%  |  0일  |  0일 / 주'));
 
     // A folder that can no longer be read: the admin who asked is told.
     delete env.state.folders.F1;
     send('UA');
     env.run('dispatchDue');
     assert.ok(env.ephemerals('UA').at(-1).includes('연차 파일 폴더를 열 수 없습니다'));
+  },
+
+  '연차 현황 colors: everyone is ⚪ before October 15, since leave resets every January 1': () => {
+    const env = connectedEnv('2026-10-14T23:58');
+    env.state.folders.F1 = { name: '연차', files: [xlsxFile('김철수', 15, 3.5, 11.5), xlsxFile('박영희', 20, 15, 5)] };
+    saveLeave(env, 'https://drive.google.com/drive/folders/F1');
+    const send = () => env.interact({ type: 'view_submission', user: { id: 'UA' }, view: { id: 'V8', callback_id: 'leave_send', private_metadata: JSON.stringify({ channelId: 'C1' }), state: { values: {} } } });
+    send();
+    env.run('dispatchDue');
+    const before = env.rawPosts('C1').at(-1);
+    assert.deepStrictEqual(tableRows(before).slice(1).map((r) => r[1]), ['⚪ 23.3%', '⚪ 75%']);
+    env.setNow('2026-10-15T00:00');
+    send();
+    env.run('dispatchDue');
+    assert.deepStrictEqual(tableRows(env.rawPosts('C1').at(-1)).slice(1).map((r) => r[1]), ['🔴 23.3%', '🟡 75%']);
+    // Weeks left count the weeks with a Thursday from today to 12/31; past the last Thursday, this week is the last one.
+    const weeks = (iso) => env.sandbox.leaveWeeksLeft_(kst(iso));
+    assert.deepStrictEqual([weeks('2026-11-23T10:00'), weeks('2026-12-24T10:00'), weeks('2026-12-25T10:00'), weeks('2026-12-31T10:00'), weeks('2027-12-31T10:00')], [6, 2, 1, 1, 1]);
+    // The thresholds: 55% is yellow, 80% is white.
+    assert.deepStrictEqual([54.9, 55, 79.9, 80].map((r) => env.sandbox.leaveDot_(r, kst('2026-12-01T09:00'))), ['🔴', '🟡', '🟡', '⚪']);
   },
 
   '연차 현황 연말 알림: up to three, each N weeks before 12/31 at its own time, moved to Friday from a weekend': () => {
