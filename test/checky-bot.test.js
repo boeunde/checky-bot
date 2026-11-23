@@ -1627,7 +1627,7 @@ const tests = {
         { name: 'broken.xlsx' },
         xlsxFile('', 15, 0, 15, { name: 'blank.xlsx' }),
         // Shortcuts are followed to their original file, which must be shared with the account too.
-        { name: '이민수_2026_연차사용계획서.xlsx', shortcutTo: 'X1' },
+        { name: '이민수_2026_월차사용계획서.xlsx', shortcutTo: 'X1' },
         { name: '최지은_2026_연차사용계획서.xlsx', shortcutTo: 'X2' },
         { name: '회의록 바로가기', shortcutTo: 'X3', targetMime: 'application/vnd.google-apps.document' },
       ],
@@ -1669,7 +1669,8 @@ const tests = {
       ['이름', '사용률', '남은 일수', '남은 주 당 사용 목표'],
       ['김철수', '🔴 23.3%', '11.5일', '1.92일 / 주'],
       ['박영희', '🟡 75%', '5일', '0.83일 / 주'],
-      ['이민수', '⚪ 100%', '0일', '0일 / 주'],
+      // 100% and over: no dot. A file named with 월차 has no weekly target.
+      ['이민수', '100%', '0일', '해당없음 / 월차'],
     ]);
     // The caution sits right above the table, on two lines.
     assert.strictEqual(post.blocks[1].type, 'context');
@@ -1687,7 +1688,7 @@ const tests = {
     env.state.noTables = true;
     send('UA');
     env.run('dispatchDue');
-    assert.ok(env.posts('C1').at(-1).includes('이름  |  사용률  |  남은 일수  |  남은 주 당 사용 목표\n김철수  |  🔴 23.3%  |  11.5일  |  1.92일 / 주\n박영희  |  🟡 75%  |  5일  |  0.83일 / 주\n이민수  |  ⚪ 100%  |  0일  |  0일 / 주'));
+    assert.ok(env.posts('C1').at(-1).includes('이름  |  사용률  |  남은 일수  |  남은 주 당 사용 목표\n김철수  |  🔴 23.3%  |  11.5일  |  1.92일 / 주\n박영희  |  🟡 75%  |  5일  |  0.83일 / 주\n이민수  |  100%  |  0일  |  해당없음 / 월차'));
 
     // A folder that can no longer be read: the admin who asked is told.
     delete env.state.folders.F1;
@@ -1713,7 +1714,8 @@ const tests = {
     const weeks = (iso) => env.sandbox.leaveWeeksLeft_(kst(iso));
     assert.deepStrictEqual([weeks('2026-11-23T10:00'), weeks('2026-12-24T10:00'), weeks('2026-12-25T10:00'), weeks('2026-12-31T10:00'), weeks('2027-12-31T10:00')], [6, 2, 1, 1, 1]);
     // The thresholds: 55% is yellow, 80% is white.
-    assert.deepStrictEqual([54.9, 55, 79.9, 80].map((r) => env.sandbox.leaveDot_(r, kst('2026-12-01T09:00'))), ['🔴', '🟡', '🟡', '⚪']);
+    assert.deepStrictEqual([54.9, 55, 79.9, 80, 99.94, 99.96, 100, 120].map((r) => env.sandbox.leaveDot_(r, kst('2026-12-01T09:00'))), ['🔴', '🟡', '🟡', '⚪', '⚪', '', '', '']);
+    assert.strictEqual(env.sandbox.leaveDot_(100, kst('2026-03-01T09:00')), '', 'no dot at 100% before October 15 either');
   },
 
   '연차 현황 연말 알림: up to three, each N weeks before 12/31 at its own time, moved to Friday from a weekend': () => {

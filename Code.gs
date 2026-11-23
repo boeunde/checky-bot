@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.3.2
+ * checky-bot v1.3.3
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -36,7 +36,7 @@ const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 �
 
 const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
 // 앱 홈 맨 아래에 보여 주는 코드 버전. 맨 위 주석의 버전과 함께 올립니다.
-const VERSION = '1.3.2';
+const VERSION = '1.3.3';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -2389,6 +2389,7 @@ function readLeaveFolder_(folderId) {
       continue;
     }
     row.updated = file.getLastUpdated().getTime();
+    row.monthly = /월차/.test(name); // 파일 이름(바로가기면 바로가기 이름)에 "월차"가 있으면 월차 대상
     const prev = byName[row.name];
     if (!prev || prev.updated < row.updated) byName[row.name] = row;
   }
@@ -2489,8 +2490,10 @@ function leaveWeeksLeft_(now) {
 /**
  * 사용률 앞에 붙이는 색 점. 연차는 매년 1월 1일에 새로 생기므로, 10월 15일 전에는 사용률이 낮은 게 자연스러워 모두 ⚪입니다.
  * 10월 15일부터는 55% 미만 🔴, 55~80% 미만 🟡, 80% 이상 ⚪(중립)입니다.
+ * 다 쓴 사람(표에 100% 이상으로 보이는 사용률)은 날짜와 관계없이 점을 붙이지 않습니다('').
  */
 function leaveDot_(rate, now) {
+  if (Math.round(rate * 10) / 10 >= 100) return '';
   const p = kstParts_(now);
   if (p.m < LEAVE_COLOR_FROM.m || (p.m === LEAVE_COLOR_FROM.m && p.d < LEAVE_COLOR_FROM.d)) return '⚪';
   if (rate < LEAVE_RED_BELOW) return '🔴';
@@ -2521,10 +2524,15 @@ function leaveMessages_(report, now, weeks) {
     const blocks = [section_(header), caution, section_('폴더에서 읽을 수 있는 연차 파일이 없습니다.'), context_(notes.join('\n'))];
     return [{ text, blocks, plainBlocks: blocks }];
   }
-  const rate = (r) => (r.rate === null ? '-' : `${leaveDot_(r.rate, now)} ${formatLeaveNumber_(r.rate, 1)}%`);
+  const rate = (r) => {
+    if (r.rate === null) return '-';
+    const dot = leaveDot_(r.rate, now);
+    return `${dot ? `${dot} ` : ''}${formatLeaveNumber_(r.rate, 1)}%`;
+  };
   const left = (r) => `${formatLeaveNumber_(r.unused, 2)}일`;
   const weeksLeft = leaveWeeksLeft_(now);
-  const target = (r) => `${formatLeaveNumber_(Math.max(r.unused, 0) / weeksLeft, 2)}일 / 주`;
+  // 월차 대상(파일 이름에 "월차")은 연말까지 나눠 쓸 연차가 아니므로 목표를 계산하지 않습니다.
+  const target = (r) => (r.monthly ? '해당없음 / 월차' : `${formatLeaveNumber_(Math.max(r.unused, 0) / weeksLeft, 2)}일 / 주`);
   const messages = [];
   for (let i = 0; i < rows.length; i += LEAVE_TABLE_ROWS) {
     const chunk = rows.slice(i, i + LEAVE_TABLE_ROWS);
