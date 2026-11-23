@@ -46,6 +46,7 @@ function createEnv(nowIso) {
     apiCalls: [],
     folders: {}, // Google Drive folders: { id: { name, files: [{ name, mime, updated, parts }] } }
     driveFiles: {}, // files outside the folders, opened by id (shortcut targets the account can open)
+    sheetExports: {}, // Google Sheets id -> zip entries of its .xlsx export (no entry: the export fails)
   };
 
   const wrapEvent = (ev) => ({
@@ -118,12 +119,13 @@ function createEnv(nowIso) {
   // A Drive file. A shortcut ({ shortcutTo: id }) has no content of its own; its target is opened by id.
   const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
   const driveFile = (file) => ({
+    getId: () => file.id,
     getName: () => file.name,
     getMimeType: () => (file.shortcutTo ? 'application/vnd.google-apps.shortcut' : file.mime || xlsxMime),
     getTargetId: () => file.shortcutTo || null,
     getTargetMimeType: () => (file.shortcutTo ? file.targetMime || xlsxMime : null),
     getLastUpdated: () => new MockDate(file.updated || 0),
-    getBlob: () => ({ parts: file.shortcutTo ? undefined : file.parts, setContentType() { return this; } }),
+    getBlob: () => ({ parts: file.shortcutTo || file.mime === 'application/vnd.google-apps.spreadsheet' ? undefined : file.parts, setContentType() { return this; } }),
   });
 
   const sandbox = {
@@ -210,6 +212,7 @@ function createEnv(nowIso) {
       getProjectTriggers: () => state.triggers.slice(),
       deleteTrigger: (t) => { state.triggers.splice(state.triggers.indexOf(t), 1); },
       newTrigger: triggerBuilder,
+      getOAuthToken: () => 'drive-token',
     },
     UrlFetchApp: { fetch: (url, opts) => {
       if (url.includes('emoji-datasource')) {
@@ -220,6 +223,13 @@ function createEnv(nowIso) {
           { unified: '1F44D', short_names: ['+1', 'thumbsup'] },
         ];
         return { getContentText: () => JSON.stringify(data), getResponseCode: () => 200 };
+      }
+      if (url.startsWith('https://www.googleapis.com/drive/v3/files/')) {
+        assert.strictEqual(opts.headers.Authorization, 'Bearer drive-token');
+        assert.ok(url.includes('/export?mimeType=application%2Fvnd.openxmlformats-officedocument.spreadsheetml.sheet'), url);
+        const id = decodeURIComponent(url.slice('https://www.googleapis.com/drive/v3/files/'.length).split('/')[0]);
+        const parts = state.sheetExports[id];
+        return { getResponseCode: () => (parts ? 200 : 404), getBlob: () => ({ parts, setContentType() { return this; } }) };
       }
       if (url.startsWith('https://slack.com/api/')) {
         assert.strictEqual(opts.headers.Authorization, 'Bearer xoxb-test');
@@ -1630,8 +1640,15 @@ const tests = {
         { name: '이민수_2026_월차사용계획서.xlsx', shortcutTo: 'X1' },
         { name: '최지은_2026_연차사용계획서.xlsx', shortcutTo: 'X2' },
         { name: '회의록 바로가기', shortcutTo: 'X3', targetMime: 'application/vnd.google-apps.document' },
+        // Google Sheets are read through their .xlsx export, also behind a shortcut.
+        xlsxFile('최가영', 15, 15, 0, { name: '최가영_2026_연차사용계획서', mime: 'application/vnd.google-apps.spreadsheet', id: 'S1' }),
+        { name: '한지민 바로가기', shortcutTo: 'X4', targetMime: 'application/vnd.google-apps.spreadsheet' },
+        { name: '깨진시트', mime: 'application/vnd.google-apps.spreadsheet', id: 'S9' },
       ],
     };
+    env.state.driveFiles.X4 = xlsxFile('한지민', 10, 5, 5, { mime: 'application/vnd.google-apps.spreadsheet', id: 'X4' });
+    env.state.sheetExports.S1 = env.state.folders.F1.files.find((x) => x.id === 'S1').parts;
+    env.state.sheetExports.X4 = env.state.driveFiles.X4.parts;
     env.state.driveFiles.X1 = xlsxFile('이민수', 10, 10, 0, { updated: kst('2026-11-01T09:00') });
 
     // Only admins see the setting; non-admins see nothing until a folder is linked.
@@ -1661,8 +1678,8 @@ const tests = {
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1, 'two requests in the same minute send once');
     const post = env.rawPosts('C1')[0];
-    assert.strictEqual(post.text, '연차 현황 | 총 3명');
-    assert.strictEqual(post.blocks[0].text.text, '*연차 현황* | 11월 23일 월요일 기준 | 총 3명');
+    assert.strictEqual(post.text, '연차 현황 | 총 5명');
+    assert.strictEqual(post.blocks[0].text.text, '*연차 현황* | 11월 23일 월요일 기준 | 총 5명');
     // From October 15: under 55% red, 55-80% yellow, 80% and over white (neutral).
     // The last column spreads the unused days over the weeks left: Thursdays from today to 12/31 (11/26 ... 12/31 = 6).
     assert.deepStrictEqual(tableRows(post), [
@@ -1671,6 +1688,8 @@ const tests = {
       ['박영희', '🟡 75.0%', '5.00일', '0.83일 / 주'],
       // 100% and over: no dot. A file named with 월차 has no weekly target.
       ['이민수', '100.0%', '0.00일', '해당없음 / 월차'],
+      ['최가영', '100.0%', '0.00일', '0.00일 / 주'],
+      ['한지민', '🔴 50.0%', '5.00일', '0.83일 / 주'],
     ]);
     // The caution sits right above the table, on two lines.
     assert.strictEqual(post.blocks[1].type, 'context');
@@ -1679,7 +1698,7 @@ const tests = {
     const notes = blocksText(post.blocks).at(-1);
     assert.ok(!notes.includes('55% 미만'), 'no color legend under the table');
     assert.ok(notes.includes('<https://drive.google.com/drive/folders/F1|2026 연차> 폴더의 엑셀 파일 기준'));
-    assert.ok(notes.includes('읽지 못한 파일 3개: blank.xlsx, broken.xlsx, 최지은_2026_연차사용계획서.xlsx (바로가기 원본을 열 수 없음)'), notes);
+    assert.ok(notes.includes('읽지 못한 파일 4개: blank.xlsx, broken.xlsx, 깨진시트, 최지은_2026_연차사용계획서.xlsx (바로가기 원본을 열 수 없음)'), notes);
     assert.strictEqual(env.channel('C1').log[0].text, '연차 현황 채널에 발송');
     env.run('dispatchDue');
     assert.strictEqual(env.posts('C1').length, 1);
