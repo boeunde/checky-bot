@@ -1,5 +1,5 @@
 /**
- * checky-bot v1.3.1
+ * checky-bot v1.3.2
  * 공용 Google 캘린더 일정을 여러 Slack 채널로 알려 주는 봇입니다.
  * 설정은 Slack에서 합니다. 알림 받을 채널에 봇을 초대하고 그 채널에서 /checky를 입력하세요.
  *
@@ -36,7 +36,7 @@ const HOME_CHANNEL_LIMIT = 40; // 앱 홈 화면은 블록 100개까지 담을 �
 
 const GITHUB_URL = 'https://github.com/boeunde/checky-bot';
 // 앱 홈 맨 아래에 보여 주는 코드 버전. 맨 위 주석의 버전과 함께 올립니다.
-const VERSION = '1.3.1';
+const VERSION = '1.3.2';
 const SPACER_IMAGE = 'https://api.slack.com/img/blocks/bkb_template_images/placeholder.png'; // 화면 여백용 회색 이미지
 const REMINDER_OFFSETS = [0, 5, 15, 30, 60];
 const DAILY_SCOPES = { all: '모든 일정', allday: '종일 일정만', timed: '시간 일정만' };
@@ -2212,6 +2212,10 @@ const LEAVE_GRACE = 30 * MINUTE; // 실행이 늦어져도 이 시간 안의 연
 const LEAVE_TABLE_ROWS = 99; // Slack 표는 머리글 포함 100줄까지입니다. 넘으면 메시지를 나눕니다.
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
+// 사용률 색 점(leaveDot_). 연차가 1월 1일에 새로 생기는 회사 기준입니다.
+const LEAVE_COLOR_FROM = { m: 10, d: 15 }; // 이 날 전에 보내는 메시지는 모두 ⚪
+const LEAVE_RED_BELOW = 55; // % 미만 🔴
+const LEAVE_NEUTRAL_FROM = 80; // % 이상 ⚪, 그 사이는 🟡
 
 function defaultLeaveSet_(id, weeks) {
   return { id, weeks: weeks || 2, time: 10 * 60 };
@@ -2470,30 +2474,57 @@ function formatHour_(minutes) {
 }
 
 /**
- * 연차 현황 메시지: 머리글 + 표(이름 | 사용률 | 남은 일수) + 회색 안내 줄.
+ * 오늘부터 12월 31일까지 남은 주 수. 목요일이 들어 있는 주를 한 주로 셉니다(오늘~12월 31일 사이의 목요일 수).
+ * 올해 마지막 목요일이 지났으면 이번 주를 마지막 한 주로 봅니다.
+ */
+function leaveWeeksLeft_(now) {
+  const end = Date.parse(`${kstParts_(now).y}-12-31T00:00:00+09:00`);
+  let count = 0;
+  for (let day = kstDayStart_(now); day <= end; day += DAY) {
+    if (kstParts_(day).dow === 4) count++;
+  }
+  return Math.max(count, 1);
+}
+
+/**
+ * 사용률 앞에 붙이는 색 점. 연차는 매년 1월 1일에 새로 생기므로, 10월 15일 전에는 사용률이 낮은 게 자연스러워 모두 ⚪입니다.
+ * 10월 15일부터는 55% 미만 🔴, 55~80% 미만 🟡, 80% 이상 ⚪(중립)입니다.
+ */
+function leaveDot_(rate, now) {
+  const p = kstParts_(now);
+  if (p.m < LEAVE_COLOR_FROM.m || (p.m === LEAVE_COLOR_FROM.m && p.d < LEAVE_COLOR_FROM.d)) return '⚪';
+  if (rate < LEAVE_RED_BELOW) return '🔴';
+  if (rate < LEAVE_NEUTRAL_FROM) return '🟡';
+  return '⚪';
+}
+
+/**
+ * 연차 현황 메시지: 머리글 + 안내(2줄) + 표(이름 | 사용률 | 남은 일수 | 남은 주 당 사용 목표) + 회색 안내 줄.
  * plainBlocks는 표 블록을 쓸 수 없을 때 보낼 글자 표입니다.
  */
 function leaveMessages_(report, now, weeks) {
   const day = kstDayStart_(now);
   const title = weeks ? '연말 연차 알림' : '연차 현황';
   const rows = report.rows;
+  // 엑셀에는 앞으로 쓸 연차를 미리 적어 둘 수 있어, 읽은 시각을 기준으로 밝힙니다. 표 바로 위에 둡니다.
+  const caution = context_(`이 데이터는 아직 시작되지 않은 일정이 계산에 포함될 수 있습니다.\n오늘 ${formatHour_(kstParts_(now).minutes)}까지 등록이 완료된 일정을 기준으로 메시지가 작성됩니다.`);
   const notes = [];
   if (weeks) {
     const left = Math.round((Date.parse(`${kstParts_(now).y}-12-31T00:00:00+09:00`) - day) / DAY);
     notes.push(left > 0 ? `12월 31일까지 ${left}일 남았습니다.` : '오늘이 올해 마지막 날입니다.');
   }
-  // 엑셀에는 앞으로 쓸 연차를 미리 적어 둘 수 있어, 읽은 시각을 기준으로 밝힙니다.
-  notes.push(`이 데이터는 아직 시작되지 않은 일정이 계산에 포함될 수 있습니다. 오늘 ${formatHour_(kstParts_(now).minutes)}까지 등록이 완료된 일정을 기준으로 메시지가 작성됩니다.`);
   notes.push(`<${folderUrl_(report.folderId)}|${escapeSlack_(report.folderName)}> 폴더의 엑셀 파일 기준 (사용률 = 사용 ÷ 발생)`);
   if (report.skipped.length) notes.push(`:warning: 읽지 못한 파일 ${report.skipped.length}개: ${report.skipped.map(escapeSlack_).join(', ')}`);
   const header = `*${title}* | ${formatDayLong_(day)} 기준 | 총 ${rows.length}명`;
   const text = `${title} | 총 ${rows.length}명`;
   if (!rows.length) {
-    const blocks = [section_(header), section_('폴더에서 읽을 수 있는 연차 파일이 없습니다.'), context_(notes.join('\n'))];
+    const blocks = [section_(header), caution, section_('폴더에서 읽을 수 있는 연차 파일이 없습니다.'), context_(notes.join('\n'))];
     return [{ text, blocks, plainBlocks: blocks }];
   }
-  const rate = (r) => (r.rate === null ? '-' : `${formatLeaveNumber_(r.rate, 1)}%`);
+  const rate = (r) => (r.rate === null ? '-' : `${leaveDot_(r.rate, now)} ${formatLeaveNumber_(r.rate, 1)}%`);
   const left = (r) => `${formatLeaveNumber_(r.unused, 2)}일`;
+  const weeksLeft = leaveWeeksLeft_(now);
+  const target = (r) => `${formatLeaveNumber_(Math.max(r.unused, 0) / weeksLeft, 2)}일 / 주`;
   const messages = [];
   for (let i = 0; i < rows.length; i += LEAVE_TABLE_ROWS) {
     const chunk = rows.slice(i, i + LEAVE_TABLE_ROWS);
@@ -2502,15 +2533,17 @@ function leaveMessages_(report, now, weeks) {
     const bold = (value) => ({ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: value, style: { bold: true } }] }] });
     const table = {
       type: 'table',
-      column_settings: [{ align: 'left' }, { align: 'right' }, { align: 'right' }],
-      rows: [[bold('이름'), bold('사용률'), bold('남은 일수')]].concat(chunk.map((r) => [cell(r.name), cell(rate(r)), cell(left(r))])),
+      column_settings: [{ align: 'left' }, { align: 'right' }, { align: 'right' }, { align: 'right' }],
+      rows: [[bold('이름'), bold('사용률'), bold('남은 일수'), bold('남은 주 당 사용 목표')]]
+        .concat(chunk.map((r) => [cell(r.name), cell(rate(r)), cell(left(r)), cell(target(r))])),
     };
-    const lines = chunk.map((r) => `${r.name}  |  ${rate(r)}  |  ${left(r)}`);
+    const lines = chunk.map((r) => `${r.name}  |  ${rate(r)}  |  ${left(r)}  |  ${target(r)}`);
     const footer = i + LEAVE_TABLE_ROWS >= rows.length ? [context_(notes.join('\n'))] : [];
+    const top = i === 0 ? [section_(head), caution] : [section_(head)];
     messages.push({
       text,
-      blocks: [section_(head), table].concat(footer),
-      plainBlocks: [section_(head), section_(`이름  |  사용률  |  남은 일수\n${lines.join('\n')}`)].concat(footer),
+      blocks: top.concat(table, footer),
+      plainBlocks: top.concat(section_(`이름  |  사용률  |  남은 일수  |  남은 주 당 사용 목표\n${lines.join('\n')}`), footer),
     });
   }
   return messages;
